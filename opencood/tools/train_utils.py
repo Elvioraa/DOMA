@@ -4,6 +4,7 @@
 
 import glob
 import importlib
+import math
 import yaml
 import os
 import re
@@ -225,6 +226,14 @@ def setup_optimizer(hypes, model):
     optimizer_method = getattr(optim, method_dict['core_method'], None)
     if not optimizer_method:
         raise ValueError('{} is not supported'.format(method_dict['name']))
+    doma_group_config = method_dict.get('doma_param_groups')
+    if _doma_param_groups_enabled(doma_group_config):
+        return _setup_doma_optimizer_groups(method_dict,
+                                            optimizer_method,
+                                            model,
+                                            doma_group_config)
+    # Keep the legacy optimizer construction byte-for-byte when the opt-in
+    # DOMA parameter-group feature is absent or explicitly disabled.
     if 'args' in method_dict:
         return optimizer_method(model.parameters(),
                                 lr=method_dict['lr'],
@@ -232,6 +241,102 @@ def setup_optimizer(hypes, model):
     else:
         return optimizer_method(model.parameters(),
                                 lr=method_dict['lr'])
+
+
+def _doma_param_groups_enabled(config):
+    """Return the explicit opt-in flag; a missing block defaults to disabled."""
+    if config is None:
+        return False
+    if not isinstance(config, dict):
+        raise TypeError('optimizer.doma_param_groups must be a mapping')
+    enabled = config.get('enabled', False)
+    if type(enabled) is not bool:
+        raise TypeError('optimizer.doma_param_groups.enabled must be bool')
+    return enabled
+
+
+def _setup_doma_optimizer_groups(method_dict,
+                                 optimizer_method,
+                                 model,
+                                 config):
+    """Build opt-in base/DOMA groups for DOMA-specific hyperparameters."""
+    unknown_keys = sorted(set(config) - {'enabled', 'weight_decay'})
+    if unknown_keys:
+        raise ValueError(
+            'optimizer.doma_param_groups has unknown keys: {}'.format(
+                ', '.join(unknown_keys)))
+
+    doma_weight_decay = config.get('weight_decay', 0.0)
+    if (isinstance(doma_weight_decay, bool) or
+            not isinstance(doma_weight_decay, (int, float))):
+        raise TypeError(
+            'optimizer.doma_param_groups.weight_decay must be a real number')
+    doma_weight_decay = float(doma_weight_decay)
+    if not math.isfinite(doma_weight_decay) or doma_weight_decay < 0.0:
+        raise ValueError(
+            'optimizer.doma_param_groups.weight_decay must be finite and non-negative')
+
+    named_trainable = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    ]
+    base_params = [
+        parameter
+        for name, parameter in named_trainable
+        if not name.startswith('doma_')
+    ]
+    doma_params = [
+        parameter
+        for name, parameter in named_trainable
+        if name.startswith('doma_')
+    ]
+    if not doma_params:
+        raise RuntimeError(
+            'DOMA optimizer groups are enabled, but no trainable doma_ parameters were found')
+
+    base_ids = {id(parameter) for parameter in base_params}
+    doma_ids = {id(parameter) for parameter in doma_params}
+    if base_ids & doma_ids:
+        raise RuntimeError('base and DOMA optimizer parameter groups overlap')
+    grouped_params = base_params + doma_params
+    grouped_ids = [id(parameter) for parameter in grouped_params]
+    expected_ids = {
+        id(parameter)
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    }
+    if len(grouped_ids) != len(set(grouped_ids)):
+        raise RuntimeError('optimizer parameter groups contain duplicate parameters')
+    if set(grouped_ids) != expected_ids:
+        raise RuntimeError(
+            'optimizer parameter groups do not cover every trainable parameter exactly once')
+
+    optimizer_args = dict(method_dict.get('args', {}))
+    base_group = {'params': base_params}
+    if 'weight_decay' in optimizer_args:
+        base_group['weight_decay'] = optimizer_args.pop('weight_decay')
+    doma_group = {
+        'params': doma_params,
+        'weight_decay': doma_weight_decay,
+    }
+    optimizer = optimizer_method([base_group, doma_group],
+                                 lr=method_dict['lr'],
+                                 **optimizer_args)
+
+    print('[DOMA Optimizer Groups]')
+    print('enabled=True')
+    print('optimizer={}'.format(method_dict['core_method']))
+    print('base_params={}'.format(
+        sum(parameter.numel() for parameter in base_params)))
+    print('base_weight_decay={}'.format(
+        optimizer.param_groups[0]['weight_decay']))
+    print('doma_params={}'.format(
+        sum(parameter.numel() for parameter in doma_params)))
+    print('doma_weight_decay={}'.format(
+        optimizer.param_groups[1]['weight_decay']))
+    print('lr={}'.format(method_dict['lr']))
+    return optimizer
 
 
 def setup_lr_schedular(hypes, optimizer, init_epoch=None):
