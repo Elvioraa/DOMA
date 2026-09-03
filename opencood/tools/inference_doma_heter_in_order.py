@@ -50,6 +50,11 @@ def test_parser():
                         help="detection range is [-204.8, +204.8, -102.4, +102.4]")
     parser.add_argument('--no_score', action='store_true',
                         help="whether print the score of prediction")
+    parser.add_argument(
+        '--disable_doma_refine',
+        action='store_true',
+        help='diagnostic only: keep the same DOMA model forward and Official '
+             'post-processing, but skip final DOMA post-NMS geometry refinement')
     parser.add_argument('--use_cav', type=str, default="[1,2,3,4]",
                         help="evaluate with real collaborator number")
     parser.add_argument('--lidar_degrade', action='store_true',
@@ -63,6 +68,9 @@ def main():
     opt = test_parser()
     if opt.fusion_method != 'intermediate':
         raise ValueError('DOMA ordered inference supports intermediate fusion only')
+    if opt.disable_doma_refine:
+        print('[DOMA DIAG] Final post-NMS geometry refinement is DISABLED; '
+              'using Official post-process boxes.')
 
     assert opt.fusion_method in ['late', 'early', 'intermediate', 'no', 'no_w_uncertainty', 'single'] 
 
@@ -229,7 +237,10 @@ def main():
                                                             use_cav)
                 elif opt.fusion_method == 'intermediate':
                     infer_result = inference_intermediate_fusion_doma(
-                        batch_data, model, opencood_dataset
+                        batch_data,
+                        model,
+                        opencood_dataset,
+                        disable_doma_refine=opt.disable_doma_refine,
                     )
                 elif opt.fusion_method == 'no':
                     infer_result = inference_utils.inference_no_fusion(batch_data,
@@ -329,24 +340,26 @@ def inference_late_fusion_heter_in_order(batch_data, model, dataset, use_cav):
 
 
 
-def inference_intermediate_fusion_doma(batch_data, model, dataset):
-    """Run Official post-processing, then DOMA post-NMS geometry refinement."""
+def inference_intermediate_fusion_doma(
+        batch_data, model, dataset, disable_doma_refine=False):
+    """Run Official post-processing and optional DOMA post-NMS refinement."""
     output_dict = OrderedDict()
     output_dict["ego"] = model(batch_data["ego"])
     pred_box_tensor, pred_score, gt_box_tensor = dataset.post_process(
         batch_data, output_dict
     )
-    ego_output = output_dict["ego"]
-    if "doma_context" not in ego_output:
-        raise RuntimeError(
-            "DOMA inference output is missing same-forward Common-BEV context"
+    if not disable_doma_refine:
+        ego_output = output_dict["ego"]
+        if "doma_context" not in ego_output:
+            raise RuntimeError(
+                "DOMA inference output is missing same-forward Common-BEV context"
+            )
+        pred_box_tensor, pred_score = refine_doma_detections(
+            model,
+            pred_box_tensor,
+            pred_score,
+            ego_output["doma_context"],
         )
-    pred_box_tensor, pred_score = refine_doma_detections(
-        model,
-        pred_box_tensor,
-        pred_score,
-        ego_output["doma_context"],
-    )
     result = {
         "pred_box_tensor": pred_box_tensor,
         "pred_score": pred_score,
@@ -357,4 +370,3 @@ def inference_intermediate_fusion_doma(batch_data, model, dataset):
 
 if __name__ == '__main__':
     main()
-
