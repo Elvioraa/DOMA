@@ -33,6 +33,45 @@ class DOMAPointPillarPyramidLoss(PointPillarPyramidLoss):
                 self.loss_dict.get("doma_mean_roi_coverage", 0.0),
             )
         )
+        if "doma_protocol_loss" in self.loss_dict:
+            print(
+                "[DOMA OPA consistency proxy] Loss: %.3e"
+                " || Weighted: %.3e || Branch-pairs: %d"
+                % (
+                    self.loss_dict["doma_protocol_loss"],
+                    self.loss_dict["doma_protocol_weighted_loss"],
+                    self.loss_dict["doma_protocol_pair_count"],
+                )
+            )
+        if "doma_qar_loss" in self.loss_dict:
+            print(
+                "[DOMA QAR] Quality: %.3e || Weighted: %.3e"
+                " || Pred: %.3f || Target: %.3f"
+                % (
+                    self.loss_dict["doma_qar_loss"],
+                    self.loss_dict["doma_qar_weighted_loss"],
+                    self.loss_dict["doma_qar_pred_mean"],
+                    self.loss_dict["doma_qar_target_mean"],
+                )
+            )
+        if "doma_delta_iou_count" in self.loss_dict:
+            print(
+                "[DOMA Delta-IoU diagnostic] N: %d || Finite: %d"
+                " || Mean/Std: %.3f/%.3f || P10/P50/P90: %.3f/%.3f/%.3f"
+                " || Improve/Zero/Worsen: %.3f/%.3f/%.3f"
+                % (
+                    self.loss_dict["doma_delta_iou_count"],
+                    self.loss_dict["doma_delta_iou_finite_count"],
+                    self.loss_dict["doma_delta_iou_mean"],
+                    self.loss_dict["doma_delta_iou_std"],
+                    self.loss_dict["doma_delta_iou_p10"],
+                    self.loss_dict["doma_delta_iou_p50"],
+                    self.loss_dict["doma_delta_iou_p90"],
+                    self.loss_dict["doma_delta_iou_improve_ratio"],
+                    self.loss_dict["doma_delta_iou_zero_ratio"],
+                    self.loss_dict["doma_delta_iou_worsen_ratio"],
+                )
+            )
         if writer is not None:
             step = epoch * batch_len + batch_id
             for name in (
@@ -42,6 +81,30 @@ class DOMAPointPillarPyramidLoss(PointPillarPyramidLoss):
                 "doma_quality_loss",
                 "doma_valid_object_ratio",
                 "doma_mean_roi_coverage",
+                "doma_protocol_loss",
+                "doma_protocol_weighted_loss",
+                "doma_protocol_pair_count",
+                "doma_qar_loss",
+                "doma_qar_weighted_loss",
+                "doma_qar_pred_mean",
+                "doma_qar_target_mean",
+                "doma_delta_iou_count",
+                "doma_delta_iou_finite_count",
+                "doma_delta_iou_nonfinite_count",
+                "doma_delta_iou_mean",
+                "doma_delta_iou_std",
+                "doma_delta_iou_min",
+                "doma_delta_iou_p10",
+                "doma_delta_iou_p25",
+                "doma_delta_iou_p50",
+                "doma_delta_iou_p75",
+                "doma_delta_iou_p90",
+                "doma_delta_iou_max",
+                "doma_delta_iou_improve_ratio",
+                "doma_delta_iou_zero_ratio",
+                "doma_delta_iou_worsen_ratio",
+                "doma_auxiliary_loss",
+                "doma_total_loss",
             ):
                 if name in self.loss_dict:
                     writer.add_scalar(name, self.loss_dict[name], step)

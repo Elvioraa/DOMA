@@ -29,7 +29,15 @@ from opencood.data_utils.datasets import build_dataset
 from opencood.utils import eval_utils
 from opencood.visualization import vis_utils, my_vis, simple_vis
 from opencood.utils.common_utils import update_dict
-from opencood.models.sub_modules.doma_object import refine_doma_detections
+from opencood.models.sub_modules.doma_object import (
+    assert_doma_qar_checkpoint_ready,
+    refine_doma_detections,
+)
+from opencood.models.sub_modules.doma_diagnostics import (
+    DOMA_DELTA_IOU_RESULT_KEY,
+    DeltaIoUDiagnosticAccumulator,
+    compute_post_nms_delta_iou,
+)
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 
@@ -128,12 +136,35 @@ def main():
 
     print('Creating Model')
     model = train_utils.create_model(hypes)
+    delta_iou_diagnostics_inference_enabled = bool(
+        getattr(model, "doma_flags", {}).get(
+            "delta_iou_diagnostics_inference", False
+        )
+    )
+    if delta_iou_diagnostics_inference_enabled and opt.disable_doma_refine:
+        raise ValueError(
+            "inference Delta-IoU diagnostics require DOMA refinement; "
+            "remove --disable_doma_refine"
+        )
+    if (
+        delta_iou_diagnostics_inference_enabled
+        and opt.fusion_method != "intermediate"
+    ):
+        raise ValueError(
+            "inference Delta-IoU diagnostics require intermediate fusion"
+        )
+    delta_iou_neutral_threshold = None
+    if delta_iou_diagnostics_inference_enabled:
+        delta_iou_neutral_threshold = model.doma_config[
+            "delta_iou_diagnostics"
+        ]["neutral_threshold"]
     # we assume gpu is necessary
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     print('Loading Model from checkpoint')
     saved_path = opt.model_dir
     resume_epoch, model = train_utils.load_saved_model(saved_path, model)
+    assert_doma_qar_checkpoint_ready(model, resume_epoch)
     print(f"resume from {resume_epoch} epoch.")
     opt.note += f"_epoch{resume_epoch}"
     
@@ -198,6 +229,11 @@ def main():
         if opt.lidar_degrade:
             infer_info += f"_m1_{lidar_config['m1']}_m3_{lidar_config['m3']}"
 
+        delta_iou_accumulator = None
+        if delta_iou_diagnostics_inference_enabled:
+            delta_iou_accumulator = DeltaIoUDiagnosticAccumulator(
+                delta_iou_neutral_threshold
+            )
 
         for i, batch_data in enumerate(data_loader):
             # we can just save the batch_data to file. For perfomance test.
@@ -255,6 +291,16 @@ def main():
                     raise NotImplementedError('Only single, no, no_w_uncertainty, early, late and intermediate'
                                             'fusion is supported.')
 
+                if delta_iou_accumulator is not None:
+                    if DOMA_DELTA_IOU_RESULT_KEY not in infer_result:
+                        raise RuntimeError(
+                            "inference Delta-IoU diagnostics did not return "
+                            "per-proposal values"
+                        )
+                    delta_iou_accumulator.update(
+                        infer_result.pop(DOMA_DELTA_IOU_RESULT_KEY)
+                    )
+
                 pred_box_tensor = infer_result['pred_box_tensor']
                 gt_box_tensor = infer_result['gt_box_tensor']
                 pred_score = infer_result['pred_score']
@@ -298,6 +344,10 @@ def main():
                                         left_hand=left_hand)
             torch.cuda.empty_cache()
 
+        if delta_iou_accumulator is not None:
+            _print_delta_iou_diagnostic(
+                use_cav, delta_iou_accumulator.summary()
+            )
         _, ap50, ap70 = eval_utils.eval_final_results(result_stat,
                                     opt.model_dir, infer_info)
 
@@ -343,11 +393,23 @@ def inference_late_fusion_heter_in_order(batch_data, model, dataset, use_cav):
 def inference_intermediate_fusion_doma(
         batch_data, model, dataset, disable_doma_refine=False):
     """Run Official post-processing and optional DOMA post-NMS refinement."""
+    delta_iou_diagnostics_enabled = bool(
+        getattr(model, "doma_flags", {}).get(
+            "delta_iou_diagnostics_inference", False
+        )
+    )
+    if delta_iou_diagnostics_enabled and disable_doma_refine:
+        raise ValueError(
+            "inference Delta-IoU diagnostics require DOMA refinement"
+        )
     output_dict = OrderedDict()
     output_dict["ego"] = model(batch_data["ego"])
     pred_box_tensor, pred_score, gt_box_tensor = dataset.post_process(
         batch_data, output_dict
     )
+    original_pred_box_tensor = pred_box_tensor
+    if delta_iou_diagnostics_enabled and pred_box_tensor is not None:
+        original_pred_box_tensor = pred_box_tensor.detach().clone()
     if not disable_doma_refine:
         ego_output = output_dict["ego"]
         if "doma_context" not in ego_output:
@@ -365,7 +427,43 @@ def inference_intermediate_fusion_doma(
         "pred_score": pred_score,
         "gt_box_tensor": gt_box_tensor,
     }
+    if delta_iou_diagnostics_enabled:
+        result[DOMA_DELTA_IOU_RESULT_KEY] = compute_post_nms_delta_iou(
+            original_pred_box_tensor,
+            pred_box_tensor,
+            gt_box_tensor,
+        )
     return result
+
+
+def _print_delta_iou_diagnostic(use_cav, stats):
+    print("[DOMA Delta-IoU DIAG] use_cav={}".format(use_cav))
+    print(
+        "count={doma_delta_iou_count} "
+        "finite_count={doma_delta_iou_finite_count} "
+        "nonfinite_count={doma_delta_iou_nonfinite_count}".format(**stats)
+    )
+    print(
+        "mean={doma_delta_iou_mean:.8f} "
+        "std={doma_delta_iou_std:.8f} "
+        "min={doma_delta_iou_min:.8f} "
+        "max={doma_delta_iou_max:.8f} "
+        "p10={doma_delta_iou_p10:.8f} "
+        "p25={doma_delta_iou_p25:.8f} "
+        "p50={doma_delta_iou_p50:.8f} "
+        "p75={doma_delta_iou_p75:.8f} "
+        "p90={doma_delta_iou_p90:.8f}".format(**stats)
+    )
+    print(
+        "improve_ratio={doma_delta_iou_improve_ratio:.8f} "
+        "worsen_ratio={doma_delta_iou_worsen_ratio:.8f} "
+        "neutral_ratio={doma_delta_iou_neutral_ratio:.8f} "
+        "|Delta-IoU|>0.01={doma_delta_iou_abs_gt_0_01_ratio:.8f} "
+        "|Delta-IoU|>0.05={doma_delta_iou_abs_gt_0_05_ratio:.8f} "
+        "neutral_threshold={doma_delta_iou_neutral_threshold:.3e}".format(
+            **stats
+        )
+    )
 
 
 if __name__ == '__main__':

@@ -38,6 +38,7 @@ SHARED_DOMA_PREFIXES = (
     "doma_shared_context_encoder.",
     "doma_shared_multigranularity_fusion.",
     "doma_shared_quality_head.",
+    "doma_shared_qar_head.",
 )
 CORE_SHARED_DOMA_PREFIXES = SHARED_DOMA_PREFIXES[:3]
 MULTISCALE_SHARED_DOMA_PREFIXES = SHARED_DOMA_PREFIXES[3:5]
@@ -190,6 +191,94 @@ class SharedObjectQualityHead(nn.Module):
         return torch.sigmoid(self.network(torch.cat(values, dim=-1))).squeeze(-1)
 
 
+class SharedQualityAwareRefinementHead(nn.Module):
+    """Predict signed proposal-level refinement gain in ``[-1, 1]``."""
+
+    def __init__(
+        self,
+        embedding_dim,
+        geometry_dim,
+        hidden_dim,
+        zero_init_output,
+        require_checkpoint,
+    ):
+        super().__init__()
+        self.require_checkpoint = bool(require_checkpoint)
+        self.checkpoint_verified = not self.require_checkpoint
+        self.network = nn.Sequential(
+            nn.Linear(embedding_dim + geometry_dim + 8, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        if zero_init_output:
+            nn.init.zeros_(self.network[-1].weight)
+            nn.init.zeros_(self.network[-1].bias)
+
+    def forward(self, object_embedding, geometry_embedding, fused_residual):
+        """Return predicted Delta-IoU for matching proposal-level inputs."""
+        if self.require_checkpoint and not self.checkpoint_verified:
+            raise RuntimeError(
+                "QAR is enabled outside Stage1, but its Stage1-owned checkpoint "
+                "parameters have not been loaded"
+            )
+        if object_embedding.ndim != 2 or geometry_embedding.ndim != 2:
+            raise ValueError("QAR object and geometry embeddings must be rank-2")
+        if fused_residual.ndim != 2 or fused_residual.shape[1] != 8:
+            raise ValueError("QAR fused_residual must have shape [N,8]")
+        if not (
+            object_embedding.shape[0]
+            == geometry_embedding.shape[0]
+            == fused_residual.shape[0]
+        ):
+            raise ValueError("QAR proposal-level input counts must match")
+        values = torch.cat(
+            (object_embedding, geometry_embedding, fused_residual), dim=-1
+        )
+        return torch.tanh(self.network(values)).squeeze(-1)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        if self.require_checkpoint:
+            # A failed second load attempt must not inherit a prior success.
+            self.checkpoint_verified = False
+        local_state = self.state_dict()
+        expected = tuple(prefix + key for key in local_state)
+        missing = [key for key in expected if key not in state_dict]
+        malformed = []
+        for local_key, expected_value in local_state.items():
+            checkpoint_value = state_dict.get(prefix + local_key)
+            if checkpoint_value is not None and (
+                not torch.is_tensor(checkpoint_value)
+                or checkpoint_value.shape != expected_value.shape
+            ):
+                malformed.append(prefix + local_key)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        if self.require_checkpoint:
+            if missing:
+                error_msgs.append(
+                    "QAR is enabled, but the checkpoint is missing Stage1-owned "
+                    "parameters: %s" % ", ".join(missing)
+                )
+            elif not malformed:
+                self.checkpoint_verified = True
+
+
 def doma_is_enabled(args):
     """Return the explicit DOMA enable flag while rejecting ambiguous values."""
     config = args.get("doma")
@@ -315,6 +404,22 @@ def install_doma_modules(model, args):
             use_agent_distance=quality_config["use_agent_distance"],
         )
 
+    if model.doma_flags["quality_aware_refinement"]:
+        qar_config = config["quality_aware_refinement"]
+        # Every Stage2 copy participates in the frozen-shared merge contract,
+        # even when its apply_to schedule leaves QAR loss inactive there.
+        require_qar_checkpoint = bool(
+            config["mode"] == "stage2_adapt"
+            or model.doma_flags["quality_aware_refinement_inference_gate"]
+        )
+        model.doma_shared_qar_head = SharedQualityAwareRefinementHead(
+            embedding_dim=encoder_config["embedding_dim"],
+            geometry_dim=geometry_config["hidden_dim"],
+            hidden_dim=qar_config["hidden_dim"],
+            zero_init_output=qar_config["zero_init_output"],
+            require_checkpoint=require_qar_checkpoint,
+        )
+
 
 
 def configure_doma_trainability(model):
@@ -330,11 +435,20 @@ def configure_doma_trainability(model):
         "doma_shared_context_encoder",
         "doma_shared_multigranularity_fusion",
         "doma_shared_quality_head",
+        "doma_shared_qar_head",
     )
     for name in shared_names:
         if hasattr(model, name):
+            module_trainable = shared_trainable
+            if name == "doma_shared_qar_head":
+                module_trainable = bool(
+                    shared_trainable
+                    and model.doma_flags[
+                        "quality_aware_refinement_training_loss"
+                    ]
+                )
             _set_module_trainability(
-                getattr(model, name), shared_trainable, model.training
+                getattr(model, name), module_trainable, model.training
             )
 
     active_modality = model.doma_config.get("active_modality")
@@ -350,6 +464,32 @@ def configure_doma_trainability(model):
     if not model._doma_log_printed:
         _print_doma_summary(model, shared_trainable, active_modality)
         model._doma_log_printed = True
+
+
+def assert_doma_qar_checkpoint_ready(model, resume_epoch=None):
+    """Fail closed before QAR Stage2/inference can use an untrained head."""
+    if (
+        not getattr(model, "doma_enabled", False)
+        or not model.doma_flags.get("quality_aware_refinement", False)
+    ):
+        return
+    head = getattr(model, "doma_shared_qar_head", None)
+    if head is not None and not head.require_checkpoint:
+        return
+    if (
+        resume_epoch is not None
+        and int(resume_epoch) <= 0
+        and (head is None or not head.checkpoint_verified)
+    ):
+        raise RuntimeError(
+            "QAR is enabled, but no checkpoint was loaded; a trained "
+            "Stage1-owned doma_shared_qar_head is required"
+        )
+    if head is None or not head.checkpoint_verified:
+        raise RuntimeError(
+            "QAR is enabled, but the Stage1-owned doma_shared_qar_head "
+            "checkpoint parameters were not verified"
+        )
 
 
 def build_collab_doma_context(
@@ -532,6 +672,14 @@ def run_doma_training(model, context, data_dict, detector_output=None):
     yaw_mode = model.doma_config["refiner"]["yaw_mode"]
     if mode not in ("stage1_anchor", "stage2_adapt"):
         return None
+    qar_training_loss_enabled = model.doma_flags[
+        "quality_aware_refinement_training_loss"
+    ]
+    delta_iou_diagnostics_enabled = model.doma_flags[
+        "delta_iou_diagnostics_training"
+    ]
+    if mode == "stage2_adapt":
+        assert_doma_qar_checkpoint_ready(model)
     if "object_bbx_center" not in data_dict or "object_bbx_mask" not in data_dict:
         raise KeyError("DOMA training requires object_bbx_center and object_bbx_mask")
     gt_boxes = data_dict["object_bbx_center"]
@@ -551,6 +699,7 @@ def run_doma_training(model, context, data_dict, detector_output=None):
             "doma_shared_context_encoder",
             "doma_shared_multigranularity_fusion",
             "doma_shared_quality_head",
+            "doma_shared_qar_head",
         ):
             if hasattr(model, name):
                 getattr(model, name).eval()
@@ -561,11 +710,22 @@ def run_doma_training(model, context, data_dict, detector_output=None):
     coverage_sum = gt_boxes.new_zeros(())
     proposal_count = 0
     for scene_index, scene in enumerate(context["scenes"]):
-        proposals, targets = model.doma_training_proposal_sampler(
-            gt_boxes[scene_index],
-            gt_mask[scene_index],
-            with_jitter=bool(model.training),
-        )
+        protocol_enabled = model.doma_flags["object_protocol_alignment"]
+        if protocol_enabled:
+            proposals, targets, proposal_metadata = (
+                model.doma_training_proposal_sampler(
+                    gt_boxes[scene_index],
+                    gt_mask[scene_index],
+                    with_jitter=bool(model.training),
+                    return_metadata=True,
+                )
+            )
+        else:
+            proposals, targets = model.doma_training_proposal_sampler(
+                gt_boxes[scene_index],
+                gt_mask[scene_index],
+                with_jitter=bool(model.training),
+            )
         result = predict_scene_residuals(model, scene, proposals)
         target_residuals = encode_box_residual(
             proposals, targets, yaw_mode=yaw_mode
@@ -583,6 +743,11 @@ def run_doma_training(model, context, data_dict, detector_output=None):
                 "individual_targets": individual_targets,
             }
         )
+        if protocol_enabled:
+            result["protocol_pairs"] = _build_gt_proposal_protocol_pairs(
+                result.pop("_protocol_views"),
+                proposal_metadata,
+            )
         if model.doma_flags["quality"]:
             if pair_indices.numel():
                 selected_proposals = proposals.index_select(0, pair_indices[:, 0])
@@ -598,6 +763,20 @@ def run_doma_training(model, context, data_dict, detector_output=None):
             else:
                 quality_targets = proposals.new_empty((0,))
             result["quality_targets"] = quality_targets.detach()
+        if qar_training_loss_enabled or delta_iou_diagnostics_enabled:
+            valid_proposals = result["any_valid"]
+            delta_iou = _detached_delta_iou(
+                proposals[valid_proposals],
+                result["refined_boxes"][valid_proposals],
+                targets[valid_proposals],
+            )
+            if qar_training_loss_enabled:
+                result["qar_predictions"] = result["qar_prediction"][
+                    valid_proposals
+                ]
+                result["qar_targets"] = delta_iou
+            if delta_iou_diagnostics_enabled:
+                result["delta_iou"] = delta_iou
         scene_outputs.append(result)
         proposal_count += int(proposals.shape[0])
         total_pairs += int(result["valid_mask"].numel())
@@ -621,7 +800,53 @@ def run_doma_training(model, context, data_dict, detector_output=None):
     }
     if model.doma_flags["quality"]:
         payload["quality_enabled"] = True
+    if model.doma_flags["object_protocol_alignment"]:
+        payload["object_protocol_alignment_enabled"] = True
+        payload["object_protocol_alignment_config"] = dict(
+            model.doma_config["object_protocol_alignment"]
+        )
+    if qar_training_loss_enabled:
+        payload["quality_aware_refinement_training_loss_enabled"] = True
+        payload["quality_aware_refinement_training_loss_config"] = dict(
+            model.doma_config["quality_aware_refinement"]["training_loss"]
+        )
+    if delta_iou_diagnostics_enabled:
+        payload["delta_iou_diagnostics_enabled"] = True
     return payload
+
+
+@torch.no_grad()
+def _detached_delta_iou(proposals, refined_boxes, targets):
+    """Return detached per-proposal IoU change without entering a loss graph."""
+    if proposals.shape != refined_boxes.shape or proposals.shape != targets.shape:
+        raise ValueError("Delta-IoU diagnostic boxes must have matching shapes")
+    if proposals.ndim != 2 or proposals.shape[1] != 7:
+        raise ValueError("Delta-IoU diagnostic boxes must have shape [N,7]")
+    if proposals.shape[0] == 0:
+        return proposals.new_empty((0,)).detach()
+
+    valid = (
+        torch.isfinite(proposals).all(dim=1)
+        & torch.isfinite(refined_boxes).all(dim=1)
+        & torch.isfinite(targets).all(dim=1)
+        & (proposals[:, 3:6] > 0).all(dim=1)
+        & (refined_boxes[:, 3:6] > 0).all(dim=1)
+        & (targets[:, 3:6] > 0).all(dim=1)
+    )
+    delta_iou = proposals.new_full((proposals.shape[0],), float("nan"))
+    if not bool(valid.any()):
+        return delta_iou.detach()
+    valid_indices = valid.nonzero(as_tuple=False).squeeze(-1)
+    proposal_iou = aligned_rotated_bev_iou_hwl(
+        proposals.detach().index_select(0, valid_indices),
+        targets.detach().index_select(0, valid_indices),
+    )
+    refined_iou = aligned_rotated_bev_iou_hwl(
+        refined_boxes.detach().index_select(0, valid_indices),
+        targets.detach().index_select(0, valid_indices),
+    )
+    delta_iou[valid_indices] = refined_iou - proposal_iou
+    return delta_iou.detach()
 
 
 
@@ -653,6 +878,31 @@ def predict_scene_residuals(model, scene, proposals):
 
     proposal_count, agent_count = valid_mask.shape
     valid_indices = valid_mask.nonzero(as_tuple=False)
+    protocol_enabled = model.doma_flags["object_protocol_alignment"]
+    protocol_branches = (
+        model.doma_config["object_protocol_alignment"]["branches"]
+        if protocol_enabled
+        else {}
+    )
+    qar_enabled = bool(
+        model.doma_flags["quality_aware_refinement_training_loss"]
+        or model.doma_flags["quality_aware_refinement_inference_gate"]
+    )
+    embedding_dim = model.doma_config["object_encoder"]["embedding_dim"]
+    protocol_views = None
+    if protocol_enabled:
+        protocol_views = OrderedDict()
+        empty_valid_indices = valid_indices[:0]
+        if protocol_branches.get("detail") is True:
+            protocol_views["detail"] = {
+                "embeddings": roi_features.new_empty((0, embedding_dim)),
+                "valid_indices": empty_valid_indices,
+            }
+        if protocol_branches.get("context") is True:
+            protocol_views["context"] = {
+                "embeddings": context_roi_features.new_empty((0, embedding_dim)),
+                "valid_indices": empty_valid_indices,
+            }
     individual_quality = None
     if valid_indices.numel():
         proposal_indices = valid_indices[:, 0]
@@ -666,6 +916,11 @@ def predict_scene_residuals(model, scene, proposals):
         )
         detail_embedding = model.doma_shared_object_encoder(adapted_rois)
         object_embedding = detail_embedding
+        if protocol_enabled and protocol_branches.get("detail") is True:
+            protocol_views["detail"] = {
+                "embeddings": detail_embedding,
+                "valid_indices": valid_indices,
+            }
         if model.doma_flags["context"]:
             selected_context_rois = context_roi_features[
                 proposal_indices, agent_indices
@@ -679,6 +934,11 @@ def predict_scene_residuals(model, scene, proposals):
             context_embedding = model.doma_shared_context_encoder(
                 adapted_context_rois
             )
+            if protocol_enabled and protocol_branches.get("context") is True:
+                protocol_views["context"] = {
+                    "embeddings": context_embedding,
+                    "valid_indices": valid_indices,
+                }
             object_embedding = model.doma_shared_multigranularity_fusion(
                 detail_embedding, context_embedding
             )
@@ -700,6 +960,13 @@ def predict_scene_residuals(model, scene, proposals):
         per_agent_residuals = individual_residuals.new_zeros(
             (proposal_count, agent_count, 8)
         ).index_put((proposal_indices, agent_indices), individual_residuals)
+        if qar_enabled:
+            per_agent_object_embeddings = object_embedding.new_zeros(
+                (proposal_count, agent_count, embedding_dim)
+            ).index_put((proposal_indices, agent_indices), object_embedding)
+            per_agent_geometry_embeddings = geometry_embedding.new_zeros(
+                (proposal_count, agent_count, geometry_dim)
+            ).index_put((proposal_indices, agent_indices), geometry_embedding)
 
         if model.doma_flags["quality"]:
             normalized_distances = None
@@ -725,10 +992,69 @@ def predict_scene_residuals(model, scene, proposals):
         per_agent_residuals = agent_features.new_zeros(
             (proposal_count, agent_count, 8)
         )
+        if qar_enabled:
+            geometry_dim = model.doma_config["geometry"]["hidden_dim"]
+            per_agent_object_embeddings = agent_features.new_zeros(
+                (proposal_count, agent_count, embedding_dim)
+            )
+            per_agent_geometry_embeddings = agent_features.new_zeros(
+                (proposal_count, agent_count, geometry_dim)
+            )
         if model.doma_flags["quality"]:
             individual_quality = agent_features.new_empty((0,))
             per_agent_quality = agent_features.new_zeros(
                 (proposal_count, agent_count)
+            )
+
+    if protocol_enabled:
+        branch_sources = OrderedDict()
+        if protocol_branches.get("detail") is True:
+            branch_sources["detail"] = (
+                roi_features,
+                detail_valid,
+                model.doma_shared_object_encoder,
+                "object_adapter",
+            )
+        if protocol_branches.get("context") is True:
+            branch_sources["context"] = (
+                context_roi_features,
+                context_valid,
+                model.doma_shared_context_encoder,
+                "context_adapter",
+            )
+        for branch, (
+            branch_roi_features,
+            branch_valid,
+            branch_encoder,
+            adapter_namespace,
+        ) in branch_sources.items():
+            exclusive_indices = (branch_valid & ~valid_mask).nonzero(
+                as_tuple=False
+            )
+            if not exclusive_indices.numel():
+                continue
+            proposal_indices = exclusive_indices[:, 0]
+            agent_indices = exclusive_indices[:, 1]
+            selected_modalities = [
+                scene["agent_modalities"][int(index)]
+                for index in agent_indices.tolist()
+            ]
+            selected_rois = branch_roi_features[
+                proposal_indices, agent_indices
+            ]
+            adapted_rois = route_modality_adapters(
+                model,
+                selected_rois,
+                selected_modalities,
+                adapter_namespace=adapter_namespace,
+            )
+            exclusive_embeddings = branch_encoder(adapted_rois)
+            view = protocol_views[branch]
+            view["embeddings"] = torch.cat(
+                (view["embeddings"], exclusive_embeddings), dim=0
+            )
+            view["valid_indices"] = torch.cat(
+                (view["valid_indices"], exclusive_indices), dim=0
             )
 
     if not model.doma_flags["consensus"]:
@@ -757,6 +1083,41 @@ def predict_scene_residuals(model, scene, proposals):
             per_agent_residuals, valid_mask
         )
         consensus_weights = quality_fallback = None
+
+    qar_prediction = None
+    if qar_enabled:
+        pooling_weights = _doma_consensus_pool_weights(
+            model, valid_mask, consensus_weights
+        ).to(dtype=per_agent_object_embeddings.dtype)
+        pooled_object_embedding = (
+            per_agent_object_embeddings * pooling_weights.unsqueeze(-1)
+        ).sum(dim=1)
+        pooled_geometry_embedding = (
+            per_agent_geometry_embeddings * pooling_weights.unsqueeze(-1)
+        ).sum(dim=1)
+        qar_prediction = fused_residuals.new_zeros((proposal_count,))
+        if bool(any_valid.any()):
+            qar_config = model.doma_config["quality_aware_refinement"]
+            qar_object_embedding = pooled_object_embedding[any_valid]
+            qar_geometry_embedding = pooled_geometry_embedding[any_valid]
+            if (
+                model.doma_flags["quality_aware_refinement_training_loss"]
+                and qar_config["training_loss"]["detach_features"]
+            ):
+                qar_object_embedding = qar_object_embedding.detach()
+                qar_geometry_embedding = qar_geometry_embedding.detach()
+            qar_residual = fused_residuals[any_valid]
+            if qar_config["detach_residual"]:
+                qar_residual = qar_residual.detach()
+            valid_prediction = model.doma_shared_qar_head(
+                qar_object_embedding,
+                qar_geometry_embedding,
+                qar_residual,
+            )
+            valid_indices_1d = any_valid.nonzero(as_tuple=False).squeeze(-1)
+            qar_prediction = qar_prediction.index_put(
+                (valid_indices_1d,), valid_prediction
+            )
 
     decoded = decode_box_residual(
         proposals, fused_residuals, yaw_mode=yaw_mode
@@ -787,7 +1148,120 @@ def predict_scene_residuals(model, scene, proposals):
                 "quality_fallback": quality_fallback,
             }
         )
+    if protocol_enabled:
+        result["_protocol_views"] = protocol_views
+    if qar_enabled:
+        result["qar_prediction"] = qar_prediction
     return result
+
+
+def _build_gt_proposal_protocol_pairs(protocol_views, proposal_metadata):
+    """Build a same-modality clean/jitter consistency-proxy pair per GT."""
+    if not isinstance(protocol_views, dict) or not protocol_views:
+        raise ValueError("OPA requires named branch protocol views")
+    if not isinstance(proposal_metadata, dict):
+        raise TypeError("OPA proposal metadata must be a mapping")
+    target_indices = proposal_metadata.get("target_indices")
+    is_clean = proposal_metadata.get("is_clean")
+    if not torch.is_tensor(target_indices) or target_indices.ndim != 1:
+        raise ValueError("OPA target_indices must have shape [P]")
+    if target_indices.dtype != torch.long:
+        raise TypeError("OPA target_indices must use torch.long")
+    if not torch.is_tensor(is_clean) or is_clean.ndim != 1:
+        raise ValueError("OPA is_clean must have shape [P]")
+    if is_clean.dtype != torch.bool or is_clean.shape != target_indices.shape:
+        raise ValueError("OPA is_clean must be bool and match target_indices")
+
+    pairs = OrderedDict()
+    for branch, view in protocol_views.items():
+        if not isinstance(view, dict):
+            raise TypeError("OPA %s protocol view must be a mapping" % branch)
+        embeddings = view.get("embeddings")
+        valid_indices = view.get("valid_indices")
+        if not torch.is_tensor(embeddings):
+            raise TypeError("OPA %s embeddings must be a tensor" % branch)
+        if not torch.is_tensor(valid_indices):
+            raise TypeError("OPA %s valid indices must be a tensor" % branch)
+        if valid_indices.ndim != 2 or valid_indices.shape[1] != 2:
+            raise ValueError(
+                "OPA %s valid indices must have shape [M,2]" % branch
+            )
+        if valid_indices.dtype != torch.long:
+            raise TypeError("OPA %s valid indices must use torch.long" % branch)
+        if embeddings.ndim != 2 or embeddings.shape[0] != valid_indices.shape[0]:
+            raise ValueError("OPA %s embeddings must have shape [M,D]" % branch)
+        if (
+            valid_indices.numel()
+            and int(valid_indices[:, 0].max()) >= target_indices.shape[0]
+        ):
+            raise ValueError(
+                "OPA %s valid proposal index exceeds proposal metadata" % branch
+            )
+
+        packed_target_indices = target_indices.index_select(
+            0, valid_indices[:, 0]
+        )
+        packed_is_clean = is_clean.index_select(0, valid_indices[:, 0])
+        clean_by_object_agent = {}
+        for packed_index, (target_index, agent_index) in enumerate(
+            zip(packed_target_indices.tolist(), valid_indices[:, 1].tolist())
+        ):
+            if not bool(packed_is_clean[packed_index]):
+                continue
+            key = (int(target_index), int(agent_index))
+            if key in clean_by_object_agent:
+                raise RuntimeError(
+                    "OPA %s found duplicate clean proposals for one "
+                    "object-agent pair" % branch
+                )
+            clean_by_object_agent[key] = packed_index
+
+        jitter_positions = []
+        clean_reference_positions = []
+        for packed_index, (target_index, agent_index) in enumerate(
+            zip(packed_target_indices.tolist(), valid_indices[:, 1].tolist())
+        ):
+            if bool(packed_is_clean[packed_index]):
+                continue
+            clean_reference_index = clean_by_object_agent.get(
+                (int(target_index), int(agent_index))
+            )
+            if clean_reference_index is not None:
+                jitter_positions.append(packed_index)
+                clean_reference_positions.append(clean_reference_index)
+
+        if jitter_positions:
+            jitter_index = torch.tensor(
+                jitter_positions, dtype=torch.long, device=embeddings.device
+            )
+            clean_reference_index = torch.tensor(
+                clean_reference_positions,
+                dtype=torch.long,
+                device=embeddings.device,
+            )
+            prediction = embeddings.index_select(0, jitter_index)
+            target = embeddings.index_select(0, clean_reference_index).detach()
+        else:
+            prediction = embeddings[:0]
+            target = embeddings[:0].detach()
+        pairs[branch] = {"prediction": prediction, "target": target}
+    return pairs
+
+
+def _doma_consensus_pool_weights(model, valid_mask, consensus_weights):
+    """Return the exact proposal-agent weights used by the chosen residual path."""
+    if consensus_weights is not None:
+        if consensus_weights.shape != valid_mask.shape:
+            raise ValueError("QAR consensus weights must match valid_mask")
+        return consensus_weights
+    valid = valid_mask.to(dtype=torch.float32)
+    if model.doma_flags["consensus"]:
+        weights = valid / valid.sum(dim=1, keepdim=True).clamp_min(1.0)
+    else:
+        weights = torch.zeros_like(valid)
+        if valid.shape[1]:
+            weights[:, 0] = valid[:, 0]
+    return weights
 
 
 
@@ -942,6 +1416,7 @@ def refine_doma_detections(model, pred_box_tensor, pred_score, context):
         return pred_box_tensor, pred_score
     if model.doma_config["mode"] != "inference":
         raise RuntimeError("DOMA detection refinement requires mode=inference")
+    assert_doma_qar_checkpoint_ready(model)
     if context is None or len(context.get("scenes", ())) != 1:
         raise RuntimeError("DOMA inference requires one same-forward scene context")
     if (pred_box_tensor is None) != (pred_score is None):
@@ -959,11 +1434,42 @@ def refine_doma_detections(model, pred_box_tensor, pred_score, context):
     top_indices = torch.topk(pred_score, k=refine_count, sorted=False).indices
     selected = center_boxes.index_select(0, top_indices).detach()
     result = predict_scene_residuals(model, context["scenes"][0], selected)
-    refined_corners = boxes_hwl_to_corners_3d(result["refined_boxes"])
+    qar_gate_enabled = model.doma_flags[
+        "quality_aware_refinement_inference_gate"
+    ]
+    if qar_gate_enabled:
+        refined_boxes = result["refined_boxes"]
+        finite_refinement = torch.isfinite(refined_boxes).all(dim=1)
+        finite_refinement = finite_refinement & (refined_boxes[:, 3:6] > 0).all(
+            dim=1
+        )
+        safe_refined_boxes = torch.where(
+            finite_refinement[:, None], refined_boxes, result["proposals"]
+        )
+        refined_corners = boxes_hwl_to_corners_3d(safe_refined_boxes)
+        finite_refinement = finite_refinement & torch.isfinite(
+            refined_corners
+        ).flatten(1).all(dim=1)
+    else:
+        refined_corners = boxes_hwl_to_corners_3d(result["refined_boxes"])
     output_boxes = pred_box_tensor.clone()
-    valid_top_indices = top_indices[result["any_valid"]]
+    apply_refinement = result["any_valid"]
+    if qar_gate_enabled:
+        qar_prediction = result["qar_prediction"]
+        if qar_prediction.shape != apply_refinement.shape:
+            raise RuntimeError("QAR prediction count does not match selected proposals")
+        threshold = model.doma_config["quality_aware_refinement"][
+            "inference_gate"
+        ]["threshold"]
+        apply_refinement = (
+            apply_refinement
+            & torch.isfinite(qar_prediction)
+            & finite_refinement
+            & (qar_prediction > float(threshold))
+        )
+    valid_top_indices = top_indices[apply_refinement]
     if valid_top_indices.numel():
-        output_boxes[valid_top_indices] = refined_corners[result["any_valid"]]
+        output_boxes[valid_top_indices] = refined_corners[apply_refinement]
 
     return output_boxes, pred_score
 

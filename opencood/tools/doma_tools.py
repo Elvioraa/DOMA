@@ -9,6 +9,7 @@ from collections import OrderedDict
 import torch
 import yaml
 
+from opencood.models.sub_modules.doma_config import VALID_TRAINING_MODES
 from opencood.tools.heal_tools import get_model_path_from_dir, merge_dict
 
 
@@ -19,6 +20,7 @@ SHARED_PREFIXES = (
     "doma_shared_context_encoder.",
     "doma_shared_multigranularity_fusion.",
     "doma_shared_quality_head.",
+    "doma_shared_qar_head.",
 )
 ADAPTER_SUFFIXES = (
     "delta.0.weight",
@@ -140,6 +142,44 @@ def _copy_owned_prefix(destination, source, prefix, owner):
         destination[key] = source[key]
 
 
+def _normalize_doma_merge_config(doma_config):
+    """Return the method/training subset relevant to checkpoint merging."""
+    if not isinstance(doma_config, dict):
+        raise TypeError("DOMA merge config must be a mapping")
+
+    normalized = copy.deepcopy(doma_config)
+    normalized.pop("mode", None)
+    normalized.pop("active_modality", None)
+    normalized.pop("delta_iou_diagnostics", None)
+
+    qar_config = normalized.get("quality_aware_refinement")
+    if isinstance(qar_config, dict):
+        # Deployment policy does not change checkpoint structure or training.
+        qar_config.pop("inference_gate", None)
+        training_loss = qar_config.get("training_loss")
+        if isinstance(training_loss, dict) and "apply_to" in training_loss:
+            # apply_to has set semantics; preserve the canonical mode order so
+            # equivalent YAML lists have the same deterministic fingerprint.
+            training_loss["apply_to"] = sorted(
+                training_loss["apply_to"],
+                key=VALID_TRAINING_MODES.index,
+            )
+    return normalized
+
+
+def doma_method_fingerprint(doma_config):
+    """Serialize a normalized DOMA merge contract deterministically."""
+    return json.dumps(
+        _normalize_doma_merge_config(doma_config),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+# Backward-compatible internal spelling for callers from the earlier preview.
+_doma_merge_fingerprint = doma_method_fingerprint
+
+
 def _validate_config_fingerprints(model_dirs):
     fingerprints = []
     for model_dir in model_dirs:
@@ -148,13 +188,9 @@ def _validate_config_fingerprints(model_dirs):
             raise FileNotFoundError("DOMA merge requires %s" % config_path)
         with open(config_path, "r") as stream:
             hypes = yaml.safe_load(stream)
-        doma = copy.deepcopy(hypes["model"]["args"]["doma"])
-        for key in (
-            "mode",
-            "active_modality",
-        ):
-            doma.pop(key, None)
-        fingerprints.append(json.dumps(doma, sort_keys=True, separators=(",", ":")))
+        fingerprints.append(
+            doma_method_fingerprint(hypes["model"]["args"]["doma"])
+        )
     if len(set(fingerprints)) != 1:
         raise RuntimeError(
             "DOMA method configs differ across m2/m3/m4/m1 checkpoints"

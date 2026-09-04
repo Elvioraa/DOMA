@@ -37,10 +37,14 @@ class DOMATrainingProposalSampler(nn.Module):
         if not self.include_gt and self.jitters_per_gt == 0:
             raise ValueError("proposal sampler would generate no proposals")
 
-    def forward(self, gt_boxes, gt_mask, with_jitter=True):
-        """Return ``(proposals, targets)`` in ``[x,y,z,h,w,l,yaw]`` order."""
+    def forward(
+        self, gt_boxes, gt_mask, with_jitter=True, return_metadata=False
+    ):
+        """Return detached proposals/targets and optional pairing metadata."""
         if type(with_jitter) is not bool:
             raise TypeError("with_jitter must be bool")
+        if type(return_metadata) is not bool:
+            raise TypeError("return_metadata must be bool")
         if not torch.is_tensor(gt_boxes) or gt_boxes.ndim != 2 or gt_boxes.shape[1] != 7:
             raise ValueError("gt_boxes must have shape [M,7] in hwl order")
         if not torch.is_floating_point(gt_boxes):
@@ -52,7 +56,18 @@ class DOMATrainingProposalSampler(nn.Module):
         valid_gt = gt_boxes[gt_mask.to(dtype=torch.bool)]
         if valid_gt.numel() == 0:
             empty = gt_boxes.new_empty((0, 7))
-            return empty.detach(), empty.detach()
+            result = (empty.detach(), empty.detach())
+            if not return_metadata:
+                return result
+            metadata = {
+                "target_indices": torch.empty(
+                    (0,), dtype=torch.long, device=gt_boxes.device
+                ).detach(),
+                "is_clean": torch.empty(
+                    (0,), dtype=torch.bool, device=gt_boxes.device
+                ).detach(),
+            }
+            return result + (metadata,)
         if not bool((valid_gt[:, 3:6] > 0).all()):
             raise ValueError("valid GT height, width, and length must be positive")
         if not bool(torch.isfinite(valid_gt).all()):
@@ -60,9 +75,22 @@ class DOMATrainingProposalSampler(nn.Module):
 
         proposal_parts = []
         target_parts = []
+        if return_metadata:
+            target_index_parts = []
+            clean_parts = []
+            valid_indices = torch.arange(
+                valid_gt.shape[0], dtype=torch.long, device=valid_gt.device
+            )
         if self.include_gt:
             proposal_parts.append(valid_gt.clone())
             target_parts.append(valid_gt)
+            if return_metadata:
+                target_index_parts.append(valid_indices)
+                clean_parts.append(
+                    torch.ones(
+                        valid_gt.shape[0], dtype=torch.bool, device=valid_gt.device
+                    )
+                )
         jitter_count = self.jitters_per_gt if with_jitter else 0
         for _ in range(jitter_count):
             jittered = valid_gt.clone()
@@ -76,10 +104,26 @@ class DOMATrainingProposalSampler(nn.Module):
             )
             proposal_parts.append(jittered)
             target_parts.append(valid_gt)
+            if return_metadata:
+                target_index_parts.append(valid_indices)
+                clean_parts.append(
+                    torch.zeros(
+                        valid_gt.shape[0], dtype=torch.bool, device=valid_gt.device
+                    )
+                )
 
         proposals = torch.cat(proposal_parts, dim=0)[: self.max_proposals]
         targets = torch.cat(target_parts, dim=0)[: self.max_proposals]
-        return proposals.detach(), targets.detach()
+        result = (proposals.detach(), targets.detach())
+        if not return_metadata:
+            return result
+        metadata = {
+            "target_indices": torch.cat(target_index_parts, dim=0)[
+                : self.max_proposals
+            ].detach(),
+            "is_clean": torch.cat(clean_parts, dim=0)[: self.max_proposals].detach(),
+        }
+        return result + (metadata,)
 
 
 def _require_bool(config, key):

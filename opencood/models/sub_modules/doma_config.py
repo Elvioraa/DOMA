@@ -11,9 +11,11 @@ import re
 
 VALID_VERSIONS = ("v1", "v2", "v3")
 VALID_MODES = ("stage1_anchor", "stage2_adapt", "inference")
+VALID_TRAINING_MODES = ("stage1_anchor", "stage2_adapt")
 VALID_CONSENSUS_MODES = ("uniform_geometry_mean", "quality_weighted")
 VALID_MULTIGRANULAR_FUSIONS = ("concat_projection",)
 VALID_YAW_MODES = ("sin_cos", "sin_cos_centered")
+VALID_PROTOCOL_LOSS_TYPES = ("cosine", "smooth_l1", "mse")
 TOP_LEVEL_KEYS = (
     "enabled",
     "version",
@@ -27,6 +29,9 @@ TOP_LEVEL_KEYS = (
     "refiner",
     "multi_granularity",
     "quality",
+    "object_protocol_alignment",
+    "quality_aware_refinement",
+    "delta_iou_diagnostics",
     "consensus",
     "training_proposals",
     "loss",
@@ -205,6 +210,267 @@ def validate_doma_config(config):
     else:
         _reject_unknown(quality, ("enabled",), "doma.quality")
 
+    protocol_detail_enabled = False
+    protocol_context_enabled = False
+    protocol, protocol_enabled = _optional_feature_mapping(
+        config,
+        "object_protocol_alignment",
+        "doma.object_protocol_alignment",
+    )
+    if protocol_enabled:
+        _reject_unknown(
+            protocol,
+            (
+                "enabled",
+                "method",
+                "apply_to",
+                "hook",
+                "target_type",
+                "loss_type",
+                "weight",
+                "branches",
+            ),
+            "doma.object_protocol_alignment",
+        )
+        if protocol.get("method") != "consistency_proxy":
+            raise ValueError(
+                "doma.object_protocol_alignment.method must be "
+                "consistency_proxy; current OPA is not m1 distillation"
+            )
+        if protocol.get("apply_to") != "stage2_adapt":
+            raise ValueError(
+                "doma.object_protocol_alignment.apply_to must be stage2_adapt"
+            )
+        if protocol.get("hook") != "shared_encoder_outputs":
+            raise ValueError(
+                "doma.object_protocol_alignment.hook must be shared_encoder_outputs"
+            )
+        if protocol.get("target_type") != "gt_proposal_consistency":
+            raise ValueError(
+                "doma.object_protocol_alignment is a consistency proxy and "
+                "requires target_type=gt_proposal_consistency"
+            )
+        if protocol.get("loss_type") not in VALID_PROTOCOL_LOSS_TYPES:
+            raise ValueError(
+                "doma.object_protocol_alignment.loss_type must be one of %s"
+                % (VALID_PROTOCOL_LOSS_TYPES,)
+            )
+        _positive_real(
+            protocol.get("weight"),
+            "doma.object_protocol_alignment.weight",
+        )
+        branches = _required_mapping(
+            protocol,
+            "branches",
+            "doma.object_protocol_alignment.branches",
+        )
+        _reject_unknown(
+            branches,
+            ("detail", "context"),
+            "doma.object_protocol_alignment.branches",
+        )
+        protocol_detail_enabled = _optional_bool(
+            branches,
+            "detail",
+            False,
+            "doma.object_protocol_alignment.branches.detail",
+        )
+        protocol_context_enabled = _optional_bool(
+            branches,
+            "context",
+            False,
+            "doma.object_protocol_alignment.branches.context",
+        )
+        if not (protocol_detail_enabled or protocol_context_enabled):
+            raise ValueError(
+                "doma.object_protocol_alignment requires at least one enabled "
+                "consistency-proxy branch"
+            )
+
+    qar_training_loss_enabled = False
+    qar_training_apply_to = ()
+    qar_detach_features = False
+    qar_inference_gate_enabled = False
+    refinement, refinement_enabled = _optional_feature_mapping(
+        config,
+        "quality_aware_refinement",
+        "doma.quality_aware_refinement",
+    )
+    if refinement_enabled:
+        _reject_unknown(
+            refinement,
+            (
+                "enabled",
+                "target_type",
+                "hidden_dim",
+                "detach_residual",
+                "zero_init_output",
+                "training_loss",
+                "inference_gate",
+            ),
+            "doma.quality_aware_refinement",
+        )
+        if refinement.get("target_type") != "delta_iou":
+            raise ValueError(
+                "doma.quality_aware_refinement.target_type must be delta_iou"
+            )
+
+        training_loss = _required_mapping(
+            refinement,
+            "training_loss",
+            "doma.quality_aware_refinement.training_loss",
+        )
+        qar_training_loss_enabled = _required_bool(
+            training_loss,
+            "enabled",
+            "doma.quality_aware_refinement.training_loss.enabled",
+        )
+        if qar_training_loss_enabled:
+            _reject_unknown(
+                training_loss,
+                (
+                    "enabled",
+                    "apply_to",
+                    "loss_type",
+                    "weight",
+                    "detach_target",
+                    "detach_features",
+                ),
+                "doma.quality_aware_refinement.training_loss",
+            )
+            qar_training_apply_to = _required_mode_list(
+                training_loss,
+                "apply_to",
+                "doma.quality_aware_refinement.training_loss.apply_to",
+                VALID_TRAINING_MODES,
+            )
+            if training_loss.get("loss_type") != "smooth_l1":
+                raise ValueError(
+                    "doma.quality_aware_refinement.training_loss.loss_type "
+                    "must be smooth_l1"
+                )
+            _positive_real(
+                training_loss.get("weight"),
+                "doma.quality_aware_refinement.training_loss.weight",
+            )
+            if _required_bool(
+                training_loss,
+                "detach_target",
+                "doma.quality_aware_refinement.training_loss.detach_target",
+            ) is not True:
+                raise ValueError(
+                    "doma.quality_aware_refinement.training_loss.detach_target "
+                    "must be true"
+                )
+            qar_detach_features = _required_bool(
+                training_loss,
+                "detach_features",
+                "doma.quality_aware_refinement.training_loss.detach_features",
+            )
+            if (
+                "stage2_adapt" in qar_training_apply_to
+                and "stage1_anchor" not in qar_training_apply_to
+            ):
+                raise ValueError(
+                    "doma.quality_aware_refinement.training_loss.apply_to "
+                    "cannot be stage2-only because the QAR head is Stage1-owned"
+                )
+            if (
+                "stage2_adapt" in qar_training_apply_to
+                and qar_detach_features
+            ):
+                raise ValueError(
+                    "doma.quality_aware_refinement.training_loss.detach_features "
+                    "must be false when apply_to includes stage2_adapt"
+                )
+        else:
+            _reject_unknown(
+                training_loss,
+                ("enabled",),
+                "doma.quality_aware_refinement.training_loss",
+            )
+
+        inference_gate = _required_mapping(
+            refinement,
+            "inference_gate",
+            "doma.quality_aware_refinement.inference_gate",
+        )
+        qar_inference_gate_enabled = _required_bool(
+            inference_gate,
+            "enabled",
+            "doma.quality_aware_refinement.inference_gate.enabled",
+        )
+        if qar_inference_gate_enabled:
+            _reject_unknown(
+                inference_gate,
+                ("enabled", "mode", "threshold"),
+                "doma.quality_aware_refinement.inference_gate",
+            )
+            if inference_gate.get("mode") != "hard":
+                raise ValueError(
+                    "doma.quality_aware_refinement.inference_gate.mode must be hard"
+                )
+            _closed_interval(
+                inference_gate.get("threshold"),
+                -1.0,
+                1.0,
+                "doma.quality_aware_refinement.inference_gate.threshold",
+            )
+        else:
+            _reject_unknown(
+                inference_gate,
+                ("enabled",),
+                "doma.quality_aware_refinement.inference_gate",
+            )
+
+        if not (qar_training_loss_enabled or qar_inference_gate_enabled):
+            raise ValueError(
+                "doma.quality_aware_refinement requires training_loss or "
+                "inference_gate to be enabled"
+            )
+
+        _positive_int(
+            refinement.get("hidden_dim"),
+            "doma.quality_aware_refinement.hidden_dim",
+        )
+        for key in ("detach_residual", "zero_init_output"):
+            value = _required_bool(
+                refinement,
+                key,
+                "doma.quality_aware_refinement.%s" % key,
+            )
+            if value is not True:
+                raise ValueError(
+                    "doma.quality_aware_refinement.%s must be true" % key
+                )
+
+    delta_iou_diagnostics_apply_to = ()
+    delta_iou_diagnostics, delta_iou_diagnostics_enabled = (
+        _optional_feature_mapping(
+            config,
+            "delta_iou_diagnostics",
+            "doma.delta_iou_diagnostics",
+        )
+    )
+    if delta_iou_diagnostics_enabled:
+        _reject_unknown(
+            delta_iou_diagnostics,
+            ("enabled", "apply_to", "neutral_threshold"),
+            "doma.delta_iou_diagnostics",
+        )
+        delta_iou_diagnostics_apply_to = _required_mode_list(
+            delta_iou_diagnostics,
+            "apply_to",
+            "doma.delta_iou_diagnostics.apply_to",
+            VALID_MODES,
+        )
+        _closed_interval(
+            delta_iou_diagnostics.get("neutral_threshold"),
+            0.0,
+            1.0,
+            "doma.delta_iou_diagnostics.neutral_threshold",
+        )
+
     consensus = _required_mapping(config, "consensus", "doma.consensus")
     _reject_unknown(
         consensus,
@@ -258,16 +524,19 @@ def validate_doma_config(config):
     )
     if proposals.get("source") != "gt_jitter":
         raise ValueError("DOMA V1-V3 supports only training_proposals.source=gt_jitter")
-    _required_bool(proposals, "include_gt", "doma.training_proposals.include_gt")
-    _nonnegative_int(
+    include_gt = _required_bool(
+        proposals, "include_gt", "doma.training_proposals.include_gt"
+    )
+    jitters_per_gt = _nonnegative_int(
         proposals.get("jitters_per_gt"), "doma.training_proposals.jitters_per_gt"
     )
-    for key in (
+    jitter_std_keys = (
         "center_xy_std_rel",
         "center_z_std_rel",
         "log_size_std",
         "yaw_std_deg",
-    ):
+    )
+    for key in jitter_std_keys:
         _nonnegative_real(proposals.get(key), "doma.training_proposals.%s" % key)
     _positive_int(proposals.get("max_proposals"), "doma.training_proposals.max_proposals")
     if proposals["max_proposals"] != roi["max_train_proposals"]:
@@ -309,10 +578,49 @@ def validate_doma_config(config):
         raise ValueError("doma.refiner requires doma.object_encoder")
     if quality_enabled and not (encoder_enabled and refiner_enabled):
         raise ValueError("doma.quality requires object_encoder and refiner")
+    if protocol_enabled and not (adapter_enabled and encoder_enabled):
+        raise ValueError(
+            "doma.object_protocol_alignment requires object_adapter and object_encoder"
+        )
+    if protocol_context_enabled and not context_enabled:
+        raise ValueError(
+            "doma.object_protocol_alignment.branches.context requires the "
+            "DOMA Context path"
+        )
+    if protocol_enabled and (not include_gt or jitters_per_gt < 1):
+        raise ValueError(
+            "doma.object_protocol_alignment requires include_gt=true and "
+            "jitters_per_gt>=1"
+        )
+    if protocol_enabled and active_modality == "m1":
+        raise ValueError(
+            "doma.object_protocol_alignment requires a non-anchor Stage2 "
+            "active_modality with an adapter"
+        )
+    if protocol_enabled and not any(proposals[key] > 0 for key in jitter_std_keys):
+        raise ValueError(
+            "doma.object_protocol_alignment requires at least one non-zero "
+            "training proposal jitter standard deviation"
+        )
+    if refinement_enabled and not (encoder_enabled and refiner_enabled):
+        raise ValueError(
+            "doma.quality_aware_refinement requires object_encoder and refiner"
+        )
+    if delta_iou_diagnostics_enabled and not (
+        object_enabled and encoder_enabled and refiner_enabled
+    ):
+        raise ValueError(
+            "doma.delta_iou_diagnostics requires object space, object_encoder, "
+            "and refiner"
+        )
     if consensus_enabled and not refiner_enabled:
         raise ValueError("doma.consensus requires doma.refiner")
     if multi_enabled and not (object_enabled and encoder_enabled and detail_enabled):
         raise ValueError("multi-granularity DOMA requires object space, detail, and object encoder")
+    if (protocol_enabled or refinement_enabled) and not ablation:
+        raise ValueError(
+            "experimental OPA/QAR modules require doma.ablation=true"
+        )
 
     if ablation:
         _validate_version_ceiling(version, multi_enabled, quality_enabled)
@@ -350,8 +658,36 @@ def doma_feature_flags(config):
             "multi_granularity": False,
             "context": False,
             "quality": False,
+            "object_protocol_alignment": False,
+            "quality_aware_refinement": False,
+            "quality_aware_refinement_training_loss": False,
+            "quality_aware_refinement_inference_gate": False,
+            "delta_iou_diagnostics": False,
+            "delta_iou_diagnostics_training": False,
+            "delta_iou_diagnostics_inference": False,
         }
     multi = config["multi_granularity"]
+    protocol = config.get("object_protocol_alignment", {})
+    refinement = config.get("quality_aware_refinement", {})
+    refinement_enabled = refinement.get("enabled") is True
+    qar_training_configured = bool(
+        refinement_enabled
+        and refinement.get("training_loss", {}).get("enabled") is True
+    )
+    qar_gate_configured = bool(
+        refinement_enabled
+        and refinement.get("inference_gate", {}).get("enabled") is True
+    )
+    diagnostics = config.get("delta_iou_diagnostics", {})
+    mode = config["mode"]
+    training_mode = mode in VALID_TRAINING_MODES
+    qar_training_apply_to = refinement.get("training_loss", {}).get(
+        "apply_to", ()
+    )
+    diagnostics_apply_to = diagnostics.get("apply_to", ())
+    diagnostics_enabled = bool(
+        diagnostics.get("enabled") is True and mode in diagnostics_apply_to
+    )
     return {
         "enabled": True,
         "object_space": bool(config["object_space"]["enabled"]),
@@ -363,6 +699,28 @@ def doma_feature_flags(config):
         "multi_granularity": bool(multi["enabled"]),
         "context": bool(multi.get("enabled") and multi.get("context", {}).get("enabled")),
         "quality": bool(config["quality"]["enabled"]),
+        "object_protocol_alignment": bool(
+            protocol.get("enabled") is True
+            and config["mode"] == "stage2_adapt"
+        ),
+        "quality_aware_refinement": bool(
+            qar_training_configured or qar_gate_configured
+        ),
+        "quality_aware_refinement_training_loss": bool(
+            qar_training_configured and mode in qar_training_apply_to
+        ),
+        "quality_aware_refinement_inference_gate": bool(
+            qar_gate_configured and config["mode"] == "inference"
+        ),
+        "delta_iou_diagnostics": bool(
+            diagnostics_enabled
+        ),
+        "delta_iou_diagnostics_training": bool(
+            diagnostics_enabled and training_mode
+        ),
+        "delta_iou_diagnostics_inference": bool(
+            diagnostics_enabled and mode == "inference"
+        ),
     }
 
 
@@ -434,10 +792,40 @@ def _required_mapping(config, key, name):
     return value
 
 
+def _optional_feature_mapping(config, key, name):
+    """Return an optional feature block and its explicit enable state."""
+    if key not in config:
+        return {}, False
+    value = config[key]
+    if not isinstance(value, dict):
+        raise TypeError("%s must be a mapping" % name)
+    enabled = _optional_bool(value, "enabled", False, "%s.enabled" % name)
+    if not enabled:
+        _reject_unknown(value, ("enabled",), name)
+    return value, enabled
+
+
 def _required_bool(config, key, name):
     if key not in config or type(config[key]) is not bool:
         raise TypeError("%s must be bool" % name)
     return config[key]
+
+
+def _required_mode_list(config, key, name, allowed):
+    value = config.get(key)
+    if not isinstance(value, list):
+        raise TypeError("%s must be a list" % name)
+    if not value:
+        raise ValueError("%s must not be empty" % name)
+    invalid = [item for item in value if item not in allowed]
+    if invalid:
+        raise ValueError(
+            "%s entries must be one of %s; got %r"
+            % (name, tuple(allowed), invalid)
+        )
+    if len(value) != len(set(value)):
+        raise ValueError("%s must not contain duplicate modes" % name)
+    return tuple(value)
 
 
 def _optional_bool(config, key, default, name):
@@ -479,6 +867,13 @@ def _finite_real(value, name):
     value = float(value)
     if not math.isfinite(value):
         raise ValueError("%s must be finite" % name)
+    return value
+
+
+def _closed_interval(value, lower, upper, name):
+    value = _finite_real(value, name)
+    if value < lower or value > upper:
+        raise ValueError("%s must be in [%s,%s]" % (name, lower, upper))
     return value
 
 
