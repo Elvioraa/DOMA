@@ -22,9 +22,8 @@ import importlib
 import torch
 import open3d as o3d
 from torch.utils.data import DataLoader, Subset
-import numpy as np
 import opencood.hypes_yaml.yaml_utils as yaml_utils
-from opencood.tools import train_utils, inference_utils
+from opencood.tools import inference_utils, seed_utils, train_utils
 from opencood.data_utils.datasets import build_dataset
 from opencood.utils import eval_utils
 from opencood.visualization import vis_utils, my_vis, simple_vis
@@ -64,6 +63,7 @@ def main():
     assert opt.fusion_method in ['late', 'early', 'intermediate', 'no', 'no_w_uncertainty', 'single'] 
 
     hypes = yaml_utils.load_yaml(None, opt)
+    seed = seed_utils.seed_from_hypes(hypes)
 
     if 'heter' in hypes:
         # hypes['heter']['lidar_channels'] = 16
@@ -130,9 +130,6 @@ def main():
         model.cuda()
     model.eval()
 
-    # setting noise
-    np.random.seed(303)
-
     if opt.fusion_method == 'intermediate':
         hypes['fusion']['core_method'] += 'infer' 
     hypes['comm_range'] = 180
@@ -175,7 +172,8 @@ def main():
                                 collate_fn=opencood_dataset.collate_batch_test,
                                 shuffle=False,
                                 pin_memory=False,
-                                drop_last=False)
+                                drop_last=False,
+                                **seed_utils.dataloader_seed_kwargs(seed))
         
         # Create the dictionary for evaluation
         result_stat = {0.3: {'tp': [], 'fp': [], 'gt': 0, 'score': []},                

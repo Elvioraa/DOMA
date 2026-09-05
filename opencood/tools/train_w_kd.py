@@ -12,7 +12,7 @@ from tensorboardX import SummaryWriter
 
 import importlib
 import opencood.hypes_yaml.yaml_utils as yaml_utils
-from opencood.tools import train_utils
+from opencood.tools import seed_utils, train_utils
 from opencood.data_utils.datasets import build_dataset
 
 from icecream import ic
@@ -33,6 +33,7 @@ def train_parser():
 def main():
     opt = train_parser()
     hypes = yaml_utils.load_yaml(opt.hypes_yaml, opt)
+    seed = seed_utils.seed_from_hypes(hypes)
 
     print('Dataset Building')
     opencood_train_dataset = build_dataset(hypes, visualize=False, train=True)
@@ -46,14 +47,16 @@ def main():
                               collate_fn=opencood_train_dataset.collate_batch_train,
                               shuffle=True,
                               pin_memory=True,
-                              drop_last=True)
+                              drop_last=True,
+                              **seed_utils.dataloader_seed_kwargs(seed))
     val_loader = DataLoader(opencood_validate_dataset,
                             batch_size=hypes['train_params']['batch_size'],
                             num_workers=8,
                             collate_fn=opencood_train_dataset.collate_batch_train,
                             shuffle=True,
                             pin_memory=True,
-                            drop_last=True)
+                            drop_last=True,
+                            **seed_utils.dataloader_seed_kwargs(seed))
 
     print('Creating Model')
     model = train_utils.create_model(hypes)

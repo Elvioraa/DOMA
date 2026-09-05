@@ -8,6 +8,7 @@ from tensorboardX import SummaryWriter
 
 import opencood.hypes_yaml.yaml_utils as yaml_utils
 from opencood.tools import train_utils
+from opencood.tools import seed_utils
 from opencood.data_utils.datasets import build_dataset
 from opencood.tools import multi_gpu_utils
 from icecream import ic
@@ -35,6 +36,8 @@ def main():
     opt = train_parser()
     hypes = yaml_utils.load_yaml(opt.hypes_yaml, opt)
     multi_gpu_utils.init_distributed_mode(opt)
+    seed = seed_utils.seed_from_hypes(hypes)
+    rank = opt.rank if opt.distributed else 0
 
     print('Dataset Building')
     opencood_train_dataset = build_dataset(hypes, visualize=False, train=True)
@@ -43,8 +46,12 @@ def main():
                                               train=False)
 
     if opt.distributed:
-        sampler_train = DistributedSampler(opencood_train_dataset)
-        sampler_val = DistributedSampler(opencood_validate_dataset, shuffle=False)
+        sampler_seed_kwargs = seed_utils.distributed_sampler_seed_kwargs(seed)
+        sampler_train = DistributedSampler(opencood_train_dataset,
+                                           **sampler_seed_kwargs)
+        sampler_val = DistributedSampler(opencood_validate_dataset,
+                                         shuffle=False,
+                                         **sampler_seed_kwargs)
 
         batch_sampler_train = torch.utils.data.BatchSampler(
             sampler_train, hypes['train_params']['batch_size'], drop_last=True)
@@ -52,12 +59,14 @@ def main():
         train_loader = DataLoader(opencood_train_dataset,
                                   batch_sampler=batch_sampler_train,
                                   num_workers=8,
-                                  collate_fn=opencood_train_dataset.collate_batch_train)
+                                  collate_fn=opencood_train_dataset.collate_batch_train,
+                                  **seed_utils.dataloader_seed_kwargs(seed, rank))
         val_loader = DataLoader(opencood_validate_dataset,
                                 sampler=sampler_val,
                                 num_workers=8,
                                 collate_fn=opencood_train_dataset.collate_batch_train,
-                                drop_last=False)
+                                drop_last=False,
+                                **seed_utils.dataloader_seed_kwargs(seed, rank))
     else:
         train_loader = DataLoader(opencood_train_dataset,
                                   batch_size=hypes['train_params'][
@@ -66,14 +75,16 @@ def main():
                                   collate_fn=opencood_train_dataset.collate_batch_train,
                                   shuffle=True,
                                   pin_memory=True,
-                                  drop_last=True)
+                                  drop_last=True,
+                                  **seed_utils.dataloader_seed_kwargs(seed, rank))
         val_loader = DataLoader(opencood_validate_dataset,
                                 batch_size=hypes['train_params']['batch_size'],
                                 num_workers=8,
                                 collate_fn=opencood_train_dataset.collate_batch_train,
                                 shuffle=True,
                                 pin_memory=True,
-                                drop_last=True)
+                                drop_last=True,
+                                **seed_utils.dataloader_seed_kwargs(seed, rank))
 
     print('Creating Model')
     model = train_utils.create_model(hypes)

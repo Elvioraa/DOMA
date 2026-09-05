@@ -10,10 +10,9 @@ from typing import OrderedDict
 import torch
 import open3d as o3d
 from torch.utils.data import DataLoader
-import numpy as np
 
 import opencood.hypes_yaml.yaml_utils as yaml_utils
-from opencood.tools import train_utils, inference_utils
+from opencood.tools import inference_utils, seed_utils, train_utils
 from opencood.data_utils.datasets import build_dataset
 from opencood.utils import eval_utils
 from opencood.visualization import vis_utils, my_vis, simple_vis
@@ -41,6 +40,7 @@ def main():
     assert opt.fusion_method in ['late', 'early', 'intermediate', 'no', 'no_w_uncertainty', 'single']
 
     hypes = yaml_utils.load_yaml(None, opt)
+    seed = seed_utils.seed_from_hypes(hypes)
     
     hypes['validate_dir'] = hypes['test_dir']
     if "OPV2V" in hypes['test_dir'] or "v2xsim" in hypes['test_dir']:
@@ -80,8 +80,8 @@ def main():
         AP50 = []
         AP70 = []
         for (pos_mean, pos_std, rot_mean, rot_std) in zip(pos_mean_list, pos_std_list, rot_mean_list, rot_std_list):
-            # setting noise
-            np.random.seed(303)
+            # Keep noise levels paired only when YAML explicitly requests it.
+            seed_utils.seed_everything(seed)
             noise_setting = OrderedDict()
             noise_args = {'pos_std': pos_std,
                           'rot_std': rot_std,
@@ -107,7 +107,8 @@ def main():
                                     collate_fn=opencood_dataset.collate_batch_test,
                                     shuffle=False,
                                     pin_memory=False,
-                                    drop_last=False)
+                                    drop_last=False,
+                                    **seed_utils.dataloader_seed_kwargs(seed))
             
             # Create the dictionary for evaluation
             result_stat = {0.3: {'tp': [], 'fp': [], 'gt': 0, 'score': []},                

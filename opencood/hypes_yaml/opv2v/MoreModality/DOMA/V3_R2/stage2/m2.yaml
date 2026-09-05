@@ -1,4 +1,5 @@
 name: DOMA_V3_R2_stage2_m2
+seed: 303
 root_dir: "dataset/OPV2V/train"
 validate_dir: "dataset/OPV2V/validate"
 test_dir: "dataset/OPV2V/test"
