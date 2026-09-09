@@ -10,13 +10,30 @@ import glob
 import re
 
 def get_model_path_from_dir(model_dir):
+    # Old/default experiments still use bestval. Only an explicitly enabled
+    # saved config may opt this merge path into bestdet selection.
+    from opencood.tools import validation_detection
+
+    selected_checkpoint = \
+        validation_detection.resolve_selected_checkpoint_from_model_dir(
+            model_dir)
+    if selected_checkpoint is not None:
+        print(f"find {selected_checkpoint}.")
+        return selected_checkpoint
+
     def findLastCheckpoint(save_dir):
-        file_list = glob.glob(os.path.join(save_dir, '*epoch*.pth'))
+        file_list = []
+        for checkpoint_path in glob.glob(
+                os.path.join(save_dir, 'net_epoch*.pth')):
+            if re.fullmatch(r'net_epoch[0-9]+\.pth',
+                            os.path.basename(checkpoint_path)):
+                file_list.append(checkpoint_path)
         if file_list:
             epochs_exist = []
             for file_ in file_list:
-                result = re.findall(".*epoch(.*).pth.*", file_)
-                epochs_exist.append(int(result[0]))
+                result = re.fullmatch(r'net_epoch([0-9]+)\.pth',
+                                      os.path.basename(file_))
+                epochs_exist.append(int(result.group(1)))
             initial_epoch_ = max(epochs_exist)
         else:
             raise "No checkpoint!"

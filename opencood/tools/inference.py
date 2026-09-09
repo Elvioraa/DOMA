@@ -11,7 +11,8 @@ import torch
 import open3d as o3d
 from torch.utils.data import DataLoader, Subset
 import opencood.hypes_yaml.yaml_utils as yaml_utils
-from opencood.tools import inference_utils, seed_utils, train_utils
+from opencood.tools import (inference_utils, seed_utils, train_utils,
+                            validation_detection)
 from opencood.data_utils.datasets import build_dataset
 from opencood.utils import eval_utils
 from opencood.visualization import vis_utils, my_vis, simple_vis
@@ -95,7 +96,12 @@ def main():
 
     print('Loading Model from checkpoint')
     saved_path = opt.model_dir
-    resume_epoch, model = train_utils.load_saved_model(saved_path, model)
+    checkpoint_selection = \
+        validation_detection.get_checkpoint_selection_config(hypes)
+    selected_checkpoint = validation_detection.resolve_selected_checkpoint(
+        saved_path, checkpoint_selection)
+    resume_epoch, model = train_utils.load_saved_model(
+        saved_path, model, checkpoint_path=selected_checkpoint)
     print(f"resume from {resume_epoch} epoch.")
     opt.note += f"_epoch{resume_epoch}"
     

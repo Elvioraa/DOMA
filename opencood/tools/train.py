@@ -5,13 +5,14 @@
 import argparse
 import os
 import statistics
+import uuid
 
 import torch
 from torch.utils.data import DataLoader, Subset
 from tensorboardX import SummaryWriter
 
 import opencood.hypes_yaml.yaml_utils as yaml_utils
-from opencood.tools import seed_utils, train_utils
+from opencood.tools import seed_utils, train_utils, validation_detection
 from opencood.data_utils.datasets import build_dataset
 
 from icecream import ic
@@ -33,12 +34,20 @@ def main():
     opt = train_parser()
     hypes = yaml_utils.load_yaml(opt.hypes_yaml, opt)
     seed = seed_utils.seed_from_hypes(hypes)
+    checkpoint_selection = \
+        validation_detection.get_checkpoint_selection_config(hypes)
 
     print('Dataset Building')
     opencood_train_dataset = build_dataset(hypes, visualize=False, train=True)
     opencood_validate_dataset = build_dataset(hypes,
                                               visualize=False,
                                               train=False)
+    detection_val_loader = None
+    if checkpoint_selection["enabled"]:
+        validation_detection.validate_fusion_method(opt.fusion_method)
+        detection_val_loader = \
+            validation_detection.build_detection_validation_loader(
+                opencood_validate_dataset, seed)
 
     train_loader = DataLoader(opencood_train_dataset,
                               batch_size=hypes['train_params']['batch_size'],
@@ -90,6 +99,18 @@ def main():
         saved_path = train_utils.setup_train(hypes)
         scheduler = train_utils.setup_lr_schedular(hypes, optimizer)
 
+    best_detection_metric = -float("inf")
+    best_detection_epoch = None
+    detection_history = []
+    detection_run_id = None
+    if checkpoint_selection["enabled"]:
+        (best_detection_metric,
+         best_detection_epoch,
+         detection_history,
+         _) = validation_detection.restore_detection_selection_state(
+             saved_path, checkpoint_selection)
+        detection_run_id = uuid.uuid4().hex
+
     # we assume gpu is necessary
     if torch.cuda.is_available():
         model.to(device)
@@ -138,6 +159,73 @@ def main():
                        os.path.join(saved_path,
                                     'net_epoch%d.pth' % (epoch + 1)))
 
+        if validation_detection.should_evaluate_detection(
+                epoch, checkpoint_selection):
+            completed_epoch = epoch + 1
+            detection_metrics = validation_detection.evaluate_detection_ap(
+                model,
+                detection_val_loader,
+                opencood_validate_dataset,
+                device,
+                fusion_method=opt.fusion_method,
+            )
+            selection_metric = checkpoint_selection["metric"]
+            current_detection_metric = detection_metrics[selection_metric]
+            (best_detection_metric,
+             best_detection_epoch,
+             detection_history,
+             saved_bestdet_path,
+             is_new_best) = \
+                validation_detection.commit_detection_evaluation(
+                    model,
+                    saved_path,
+                    checkpoint_selection,
+                    detection_run_id,
+                    completed_epoch,
+                    detection_metrics,
+                    best_detection_metric,
+                    best_detection_epoch,
+                    detection_history,
+                )
+
+            print("[Detection Validation]")
+            print("Split: validation")
+            print("Epoch: {}".format(completed_epoch))
+            print("AP@0.3: {:.6f}".format(detection_metrics["ap30"]))
+            print("AP@0.5: {:.6f}".format(detection_metrics["ap50"]))
+            print("AP@0.7: {:.6f}".format(detection_metrics["ap70"]))
+            print("Selection metric: {}".format(selection_metric))
+            print("Current validation metric: {:.6f}".format(
+                current_detection_metric))
+            print("Best validation metric: {:.6f}".format(
+                best_detection_metric))
+            print("Best epoch: {}".format(best_detection_epoch))
+            writer.add_scalar("Validation_Detection_AP30",
+                              detection_metrics["ap30"], completed_epoch)
+            writer.add_scalar("Validation_Detection_AP50",
+                              detection_metrics["ap50"], completed_epoch)
+            writer.add_scalar("Validation_Detection_AP70",
+                              detection_metrics["ap70"], completed_epoch)
+
+            print("[BestDet]")
+            if is_new_best:
+                print("New best validation AP@{:.1f}".format(
+                    validation_detection.SUPPORTED_METRICS[selection_metric]))
+                print("Epoch: {}".format(completed_epoch))
+                print("{}: {:.6f}".format(
+                    selection_metric.upper(), current_detection_metric))
+                if saved_bestdet_path is not None:
+                    print("Saved: {}".format(saved_bestdet_path))
+                else:
+                    print("Checkpoint saving disabled by save_bestdet=false")
+            else:
+                print("No update for validation {}".format(selection_metric))
+                print("Current {}: {:.6f}".format(
+                    selection_metric.upper(), current_detection_metric))
+                print("Best {}: {:.6f}".format(
+                    selection_metric.upper(), best_detection_metric))
+                print("Best epoch: {}".format(best_detection_epoch))
+
         if epoch % hypes['train_params']['eval_freq'] == 0:
             valid_ave_loss = []
 
@@ -183,10 +271,16 @@ def main():
 
     run_test = True
     if run_test:
-        fusion_method = opt.fusion_method
-        cmd = f"python opencood/tools/inference.py --model_dir {saved_path} --fusion_method {fusion_method}"
-        print(f"Running command: {cmd}")
-        os.system(cmd)
+        if (checkpoint_selection["enabled"] and
+                (not checkpoint_selection["save_bestdet"] or
+                 best_detection_epoch is None)):
+            print("Skipping post-training inference: enabled checkpoint "
+                  "selection did not produce a saved bestdet checkpoint.")
+        else:
+            fusion_method = opt.fusion_method
+            cmd = f"python opencood/tools/inference.py --model_dir {saved_path} --fusion_method {fusion_method}"
+            print(f"Running command: {cmd}")
+            os.system(cmd)
 
 if __name__ == '__main__':
     main()

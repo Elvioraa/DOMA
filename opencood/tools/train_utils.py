@@ -52,7 +52,7 @@ def check_missing_key(model_state_dict, ckpt_state_dict):
     print("--------------------------------")
 
 
-def load_saved_model(saved_path, model):
+def load_saved_model(saved_path, model, checkpoint_path=None):
     """
     Load saved model if exiseted
 
@@ -70,13 +70,43 @@ def load_saved_model(saved_path, model):
     """
     assert os.path.exists(saved_path), '{} not found'.format(saved_path)
 
+    if checkpoint_path is not None:
+        if not os.path.isabs(checkpoint_path):
+            checkpoint_path = os.path.join(saved_path, checkpoint_path)
+        checkpoint_path = os.path.abspath(checkpoint_path)
+        if os.path.dirname(checkpoint_path) != os.path.abspath(saved_path):
+            raise ValueError("Explicit checkpoint must be inside saved_path")
+        checkpoint_name = os.path.basename(checkpoint_path)
+        checkpoint_match = re.fullmatch(
+            r'net_epoch(?:_bestval_at|_bestdet_at)?([0-9]+)\.pth',
+            checkpoint_name)
+        if checkpoint_match is None:
+            raise ValueError(
+                "Unsupported explicit checkpoint name: {}".format(
+                    checkpoint_name))
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(checkpoint_path)
+        checkpoint_epoch = int(checkpoint_match.group(1))
+        print("loading explicitly selected checkpoint at epoch %d" %
+              checkpoint_epoch)
+        loaded_state_dict = torch.load(checkpoint_path, map_location='cpu')
+        check_missing_key(model.state_dict(), loaded_state_dict)
+        model.load_state_dict(loaded_state_dict, strict=False)
+        return checkpoint_epoch, model
+
     def findLastCheckpoint(save_dir):
-        file_list = glob.glob(os.path.join(save_dir, '*epoch*.pth'))
+        file_list = []
+        for checkpoint_path in glob.glob(
+                os.path.join(save_dir, 'net_epoch*.pth')):
+            if re.fullmatch(r'net_epoch[0-9]+\.pth',
+                            os.path.basename(checkpoint_path)):
+                file_list.append(checkpoint_path)
         if file_list:
             epochs_exist = []
             for file_ in file_list:
-                result = re.findall(".*epoch(.*).pth.*", file_)
-                epochs_exist.append(int(result[0]))
+                result = re.fullmatch(r'net_epoch([0-9]+)\.pth',
+                                      os.path.basename(file_))
+                epochs_exist.append(int(result.group(1)))
             initial_epoch_ = max(epochs_exist)
         else:
             initial_epoch_ = 0
@@ -85,12 +115,17 @@ def load_saved_model(saved_path, model):
     file_list = glob.glob(os.path.join(saved_path, 'net_epoch_bestval_at*.pth'))
     if file_list:
         assert len(file_list) == 1
+        bestval_match = re.fullmatch(
+            r'net_epoch_bestval_at([0-9]+)\.pth',
+            os.path.basename(file_list[0]))
+        assert bestval_match is not None
+        bestval_epoch = int(bestval_match.group(1))
         print("resuming best validation model at epoch %d" % \
-                eval(file_list[0].split("/")[-1].rstrip(".pth").lstrip("net_epoch_bestval_at")))
+                bestval_epoch)
         loaded_state_dict = torch.load(file_list[0] , map_location='cpu')
         check_missing_key(model.state_dict(), loaded_state_dict)
         model.load_state_dict(loaded_state_dict, strict=False)
-        return eval(file_list[0].split("/")[-1].rstrip(".pth").lstrip("net_epoch_bestval_at")), model
+        return bestval_epoch, model
 
     initial_epoch = findLastCheckpoint(saved_path)
     if initial_epoch > 0:
