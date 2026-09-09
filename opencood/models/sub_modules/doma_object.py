@@ -167,13 +167,38 @@ class SharedObjectQualityHead(nn.Module):
         super().__init__()
         self.use_roi_coverage = bool(use_roi_coverage)
         self.use_agent_distance = bool(use_agent_distance)
-        input_dim = embedding_dim + geometry_dim
+        self.learned_dim = embedding_dim + geometry_dim
+        input_dim = self.learned_dim
         input_dim += int(self.use_roi_coverage) + int(self.use_agent_distance)
+        self.input_dim = input_dim
         self.network = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
+
+    def build_input_features(
+        self,
+        object_embedding,
+        geometry_embedding,
+        roi_coverage=None,
+        agent_distance=None,
+    ):
+        """Compose the proposal-agent Quality input on its last feature axis."""
+        values = [object_embedding, geometry_embedding]
+        if self.use_roi_coverage:
+            values.append(
+                _quality_scalar(roi_coverage, object_embedding, "roi_coverage")
+            )
+        if self.use_agent_distance:
+            values.append(
+                _quality_scalar(agent_distance, object_embedding, "agent_distance")
+            )
+        return torch.cat(values, dim=-1)
+
+    def predict_from_features(self, quality_features):
+        """Predict scalar quality from the composed ``[M,F_q]`` input."""
+        return torch.sigmoid(self.network(quality_features)).squeeze(-1)
 
     def forward(
         self,
@@ -183,12 +208,36 @@ class SharedObjectQualityHead(nn.Module):
         agent_distance=None,
     ):
         """Return scalar quality for matching valid agent-object pairs."""
-        values = [object_embedding, geometry_embedding]
-        if self.use_roi_coverage:
-            values.append(_quality_scalar(roi_coverage, object_embedding, "roi_coverage"))
-        if self.use_agent_distance:
-            values.append(_quality_scalar(agent_distance, object_embedding, "agent_distance"))
-        return torch.sigmoid(self.network(torch.cat(values, dim=-1))).squeeze(-1)
+        quality_features = self.build_input_features(
+            object_embedding,
+            geometry_embedding,
+            roi_coverage=roi_coverage,
+            agent_distance=agent_distance,
+        )
+        return self.predict_from_features(quality_features)
+
+
+class DetachedFeatureAffineCalibrator(nn.Module):
+    """Identity-initialized affine calibration of detached learned features."""
+
+    def __init__(self, feature_dim):
+        super().__init__()
+        if not isinstance(feature_dim, int) or feature_dim <= 0:
+            raise ValueError("feature_dim must be a positive integer")
+        self.feature_dim = feature_dim
+        self.gamma = nn.Parameter(torch.zeros(feature_dim))
+        self.beta = nn.Parameter(torch.zeros(feature_dim))
+
+    def forward(self, quality_features):
+        """Calibrate ``[M,learned_dim]`` without exposing its source to autograd."""
+        if not torch.is_tensor(quality_features) or quality_features.ndim != 2:
+            raise ValueError("quality_features must have shape [M, feature_dim]")
+        if quality_features.shape[-1] != self.feature_dim:
+            raise ValueError(
+                "quality feature dimension must equal %d" % self.feature_dim
+            )
+        detached = quality_features.detach()
+        return detached * (1.0 + self.gamma) + self.beta
 
 
 class SharedQualityAwareRefinementHead(nn.Module):
@@ -323,6 +372,17 @@ def install_doma_modules(model, args):
 
     model.doma_common_bev_channels = channels
     model.doma_bev_geometry = bev_geometry
+    if model.doma_flags["quality_distance_normalization"]:
+        distance_config = config["quality"]["distance_normalization"]
+        reference_geometry = DOMABEVGeometry.from_lidar_range(
+            distance_config["reference_range"]
+        )
+        if config["mode"] == "stage1_anchor" and reference_geometry != bev_geometry:
+            raise ValueError(
+                "Stage1 anchor-reference distance range must match "
+                "model.args.lidar_range"
+            )
+        model.doma_quality_distance_geometry = reference_geometry
     detail_output_size = (
         multi_config["detail"]["roi_size"]
         if model.doma_flags["multi_granularity"]
@@ -403,6 +463,15 @@ def install_doma_modules(model, args):
             use_roi_coverage=quality_config["use_roi_coverage"],
             use_agent_distance=quality_config["use_agent_distance"],
         )
+        if model.doma_flags["stage2_calibration"]:
+            feature_dim = model.doma_shared_quality_head.learned_dim
+            for modality in model.modality_name_list:
+                if modality != "m1":
+                    setattr(
+                        model,
+                        "doma_quality_calibrator_%s" % modality,
+                        DetachedFeatureAffineCalibrator(feature_dim),
+                    )
 
     if model.doma_flags["quality_aware_refinement"]:
         qar_config = config["quality_aware_refinement"]
@@ -454,7 +523,11 @@ def configure_doma_trainability(model):
     active_modality = model.doma_config.get("active_modality")
     for modality in model.modality_name_list:
         adapter_trainable = mode == "stage2_adapt" and modality == active_modality
-        for namespace in ("object_adapter", "context_adapter"):
+        for namespace in (
+            "object_adapter",
+            "context_adapter",
+            "quality_calibrator",
+        ):
             name = "doma_%s_%s" % (namespace, modality)
             if hasattr(model, name):
                 _set_module_trainability(
@@ -971,19 +1044,44 @@ def predict_scene_residuals(model, scene, proposals):
         if model.doma_flags["quality"]:
             normalized_distances = None
             if model.doma_config["quality"]["use_agent_distance"]:
-                normalized_distances = normalized_agent_object_distance(
-                    scene, proposals, model.doma_bev_geometry
+                distance_geometry = (
+                    model.doma_quality_distance_geometry
+                    if model.doma_flags["quality_distance_normalization"]
+                    else model.doma_bev_geometry
                 )
-            individual_quality = model.doma_shared_quality_head(
-                object_embedding,
-                geometry_embedding,
-                roi_coverage=coverage[proposal_indices, agent_indices],
-                agent_distance=(
-                    normalized_distances[proposal_indices, agent_indices]
-                    if normalized_distances is not None
-                    else None
-                ),
+                normalized_distances = normalized_agent_object_distance(
+                    scene, proposals, distance_geometry
+                )
+            selected_coverage = coverage[proposal_indices, agent_indices]
+            selected_distances = (
+                normalized_distances[proposal_indices, agent_indices]
+                if normalized_distances is not None
+                else None
             )
+            if model.doma_flags["stage2_calibration"]:
+                quality_features = (
+                    model.doma_shared_quality_head.build_input_features(
+                        object_embedding,
+                        geometry_embedding,
+                        roi_coverage=selected_coverage,
+                        agent_distance=selected_distances,
+                    )
+                )
+                calibrated_features = route_quality_calibrators(
+                    model, quality_features, selected_modalities
+                )
+                individual_quality = (
+                    model.doma_shared_quality_head.predict_from_features(
+                        calibrated_features
+                    )
+                )
+            else:
+                individual_quality = model.doma_shared_quality_head(
+                    object_embedding,
+                    geometry_embedding,
+                    roi_coverage=selected_coverage,
+                    agent_distance=selected_distances,
+                )
             per_agent_quality = individual_quality.new_zeros(
                 (proposal_count, agent_count)
             ).index_put((proposal_indices, agent_indices), individual_quality)
@@ -1294,6 +1392,52 @@ def route_modality_adapters(
     return packed_outputs.index_select(0, torch.argsort(packed_positions))
 
 
+def route_quality_calibrators(model, quality_features, modality_names):
+    """Calibrate only learned Quality features and preserve semantic scalars."""
+    if quality_features.shape[0] != len(modality_names):
+        raise ValueError("modality_names must match Quality feature count")
+    if quality_features.shape[0] == 0:
+        return quality_features
+    quality_head = model.doma_shared_quality_head
+    if (
+        quality_features.ndim != 2
+        or quality_features.shape[-1] != quality_head.input_dim
+    ):
+        raise ValueError(
+            "quality_features must have shape [M, %d]" % quality_head.input_dim
+        )
+    learned_dim = quality_head.learned_dim
+
+    grouped_indices = OrderedDict()
+    for index, modality in enumerate(modality_names):
+        grouped_indices.setdefault(modality, []).append(index)
+
+    output_parts = []
+    position_parts = []
+    for modality, indices in grouped_indices.items():
+        attribute = "doma_quality_calibrator_%s" % modality
+        positions = torch.tensor(
+            indices, dtype=torch.long, device=quality_features.device
+        )
+        selected = quality_features.index_select(0, positions)
+        if hasattr(model, attribute):
+            learned_features = selected[:, :learned_dim]
+            semantic_scalars = selected[:, learned_dim:].detach()
+            calibrated_learned = getattr(model, attribute)(learned_features)
+            selected = torch.cat(
+                (calibrated_learned, semantic_scalars), dim=-1
+            )
+        elif modality != "m1":
+            raise RuntimeError(
+                "DQC is missing the private calibrator for modality %s" % modality
+            )
+        output_parts.append(selected)
+        position_parts.append(positions)
+    packed_outputs = torch.cat(output_parts, dim=0)
+    packed_positions = torch.cat(position_parts, dim=0)
+    return packed_outputs.index_select(0, torch.argsort(packed_positions))
+
+
 def proposal_geometry_raw(proposals, geometry):
     """Build ``[x_norm,y_norm,z_norm,log(l,w,h),sin(yaw),cos(yaw)]``."""
     if not isinstance(geometry, DOMABEVGeometry):
@@ -1389,7 +1533,7 @@ def quality_weighted_geometry_consensus(
 
 
 def normalized_agent_object_distance(scene, proposals, geometry):
-    """Return ``[P,A]`` object-agent distance normalized by BEV diagonal."""
+    """Normalize ``[P,A]`` object-agent distance by the supplied XY diagonal."""
     positions = scene.get("agent_positions")
     if not torch.is_tensor(positions) or positions.ndim != 2 or positions.shape[1] != 2:
         raise ValueError("quality-aware scene requires agent_positions [A,2]")
@@ -1608,6 +1752,30 @@ def _print_doma_summary(model, shared_trainable, active_modality):
         total_parameters - sum(p.numel() for p in doma_parameters)
     ))
     print("total trainable parameters=%d" % all_trainable)
+    if (
+        model.doma_flags.get("stage2_calibration", False)
+        and config["mode"] == "stage2_adapt"
+    ):
+        calibrator_name = "doma_quality_calibrator_%s" % active_modality
+        calibrator = getattr(model, calibrator_name)
+        calibrator_parameters = sum(
+            parameter.numel() for parameter in calibrator.parameters()
+        )
+        calibrator_trainable = sum(
+            parameter.numel()
+            for parameter in calibrator.parameters()
+            if parameter.requires_grad
+        )
+        calibration_config = config["quality"]["stage2_calibration"]
+        print("[DOMA][DQC]")
+        print("enabled=True")
+        print("variant=%s" % calibration_config["variant"])
+        print("active_modality=%s" % active_modality)
+        print("learned_dim=%d" % calibrator.feature_dim)
+        print("quality_input_dim=%d" % model.doma_shared_quality_head.input_dim)
+        print("calibrator_module=%s" % calibrator_name)
+        print("calibrator_parameters=%d" % calibrator_parameters)
+        print("calibrator_trainable_parameters=%d" % calibrator_trainable)
 
 
 def _group_count(channels):

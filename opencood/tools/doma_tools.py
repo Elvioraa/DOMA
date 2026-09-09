@@ -30,15 +30,27 @@ ADAPTER_SUFFIXES = (
     "delta.3.weight",
     "delta.3.bias",
 )
+DQC_CALIBRATOR_PREFIX = "doma_quality_calibrator_"
+DQC_CALIBRATOR_SUFFIXES = ("gamma", "beta")
 
 
-def apply_doma_merge_ownership(merged_dict, ordered_stage_dicts):
+def apply_doma_merge_ownership(
+    merged_dict,
+    ordered_stage_dicts,
+    require_dqc_calibrators=None,
+    dqc_dimensions=None,
+):
     """Overlay DOMA keys for checkpoints ordered as m2, m3, m4, Stage1 m1."""
-    if not any(
+    has_doma_parameters = any(
         key.startswith("doma_")
         for state_dict in ordered_stage_dicts
         for key in state_dict
-    ):
+    )
+    if not has_doma_parameters:
+        if require_dqc_calibrators is True:
+            raise RuntimeError(
+                "DQC-enabled merge requires DOMA and calibrator checkpoint keys"
+            )
         return merged_dict
     if len(ordered_stage_dicts) != 4:
         raise RuntimeError("DOMA merge_final requires m2, m3, m4, m1 order")
@@ -49,6 +61,41 @@ def apply_doma_merge_ownership(merged_dict, ordered_stage_dicts):
         "m4": ordered_stage_dicts[2],
     }
     stage1 = ordered_stage_dicts[3]
+    has_dqc_calibrators = any(
+        key.startswith(DQC_CALIBRATOR_PREFIX)
+        for state_dict in ordered_stage_dicts
+        for key in state_dict
+    )
+    if (
+        require_dqc_calibrators is not None
+        and has_dqc_calibrators is not bool(require_dqc_calibrators)
+    ):
+        raise RuntimeError(
+            "DQC checkpoint keys do not match the merged method config; "
+            "required=%s present=%s"
+            % (bool(require_dqc_calibrators), has_dqc_calibrators)
+        )
+    if has_dqc_calibrators:
+        if dqc_dimensions is None:
+            raise RuntimeError(
+                "DQC merge requires config-derived learned/input dimensions"
+            )
+        stage1_calibrators = sorted(
+            key for key in stage1 if key.startswith(DQC_CALIBRATOR_PREFIX)
+        )
+        if stage1_calibrators:
+            raise RuntimeError(
+                "Stage1 m1 checkpoint must not own DQC calibrators: %s"
+                % ", ".join(stage1_calibrators)
+            )
+        for modality, source in stage2_by_modality.items():
+            _validate_owned_dqc_calibrator(
+                source,
+                modality,
+                "stage2/%s" % modality,
+                dqc_dimensions,
+            )
+
     result = OrderedDict(merged_dict)
     stage1_shared = {key for key in stage1 if key.startswith(SHARED_PREFIXES)}
     if not stage1_shared:
@@ -105,6 +152,8 @@ def apply_doma_merge_ownership(merged_dict, ordered_stage_dicts):
                 "Stage2 %s unexpectedly contains a higher-version Context adapter"
                 % modality
             )
+        if has_dqc_calibrators:
+            _copy_owned_dqc_calibrator(result, source, modality)
     return result
 
 
@@ -112,7 +161,17 @@ def merge_and_save_final(aligned_model_dir_list, output_model_dir):
     """Run Official HEAL merge order, then enforce DOMA ownership."""
     if len(aligned_model_dir_list) != 4:
         raise ValueError("expected model directories in m2, m3, m4, m1 order")
-    _validate_config_fingerprints(aligned_model_dir_list)
+    doma_config = _validate_config_fingerprints(aligned_model_dir_list)
+    require_dqc_calibrators = bool(
+        doma_config.get("quality", {})
+        .get("stage2_calibration", {})
+        .get("enabled") is True
+    )
+    dqc_dimensions = (
+        _dqc_dimensions_from_config(doma_config)
+        if require_dqc_calibrators
+        else None
+    )
     final_dict = OrderedDict()
     ordered_stage_dicts = []
     for model_dir in aligned_model_dir_list:
@@ -120,7 +179,12 @@ def merge_and_save_final(aligned_model_dir_list, output_model_dir):
         state_dict = torch.load(checkpoint_path, map_location="cpu")
         ordered_stage_dicts.append(state_dict)
         final_dict = merge_dict(final_dict, state_dict)
-    final_dict = apply_doma_merge_ownership(final_dict, ordered_stage_dicts)
+    final_dict = apply_doma_merge_ownership(
+        final_dict,
+        ordered_stage_dicts,
+        require_dqc_calibrators=require_dqc_calibrators,
+        dqc_dimensions=dqc_dimensions,
+    )
     os.makedirs(output_model_dir, exist_ok=True)
     output_path = os.path.join(output_model_dir, "net_epoch1.pth")
     torch.save(final_dict, output_path)
@@ -140,6 +204,90 @@ def _copy_owned_prefix(destination, source, prefix, owner):
         )
     for key in sorted(keys):
         destination[key] = source[key]
+
+
+def _validate_owned_dqc_calibrator(source, modality, owner, dqc_dimensions):
+    prefix = "%s%s." % (DQC_CALIBRATOR_PREFIX, modality)
+    owned_keys = {key for key in source if key.startswith(prefix)}
+    expected = {prefix + suffix for suffix in DQC_CALIBRATOR_SUFFIXES}
+    foreign_keys = {
+        key
+        for key in source
+        if key.startswith(DQC_CALIBRATOR_PREFIX) and not key.startswith(prefix)
+    }
+    if owned_keys != expected or foreign_keys:
+        missing = sorted(expected - owned_keys)
+        extra = sorted((owned_keys - expected) | foreign_keys)
+        raise RuntimeError(
+            "%s DQC calibrator ownership contract differs for %s; "
+            "missing=%s extra_or_foreign=%s"
+            % (owner, prefix, missing, extra)
+        )
+    gamma = source[prefix + "gamma"]
+    beta = source[prefix + "beta"]
+    quality_input_weight = source.get(
+        "doma_shared_quality_head.network.0.weight"
+    )
+    refiner_input_weight = source.get(
+        "doma_shared_object_refiner.network.0.weight"
+    )
+    learned_dim, quality_input_dim = dqc_dimensions
+    if (
+        not torch.is_tensor(gamma)
+        or not torch.is_tensor(beta)
+        or gamma.ndim != 1
+        or beta.ndim != 1
+        or gamma.shape != beta.shape
+        or gamma.shape[0] != learned_dim
+        or not torch.is_tensor(quality_input_weight)
+        or quality_input_weight.ndim != 2
+        or quality_input_weight.shape[1] != quality_input_dim
+        or not torch.is_tensor(refiner_input_weight)
+        or refiner_input_weight.ndim != 2
+        or refiner_input_weight.shape[1] != learned_dim
+    ):
+        raise RuntimeError(
+            "%s DQC gamma/beta must be equal one-dimensional tensors "
+            "matching the config-derived learned dimension; shared Quality "
+            "Head and Object Refiner input dimensions must also match config"
+            % owner
+        )
+
+
+def _copy_owned_dqc_calibrator(destination, source, modality):
+    prefix = "%s%s." % (DQC_CALIBRATOR_PREFIX, modality)
+    for suffix in DQC_CALIBRATOR_SUFFIXES:
+        key = prefix + suffix
+        destination[key] = source[key]
+
+
+def _dqc_dimensions_from_config(doma_config):
+    """Return learned and full Quality dimensions without hard-coded widths."""
+    object_config = doma_config.get("object_encoder", {})
+    geometry_config = doma_config.get("geometry", {})
+    quality_config = doma_config.get("quality", {})
+    embedding_dim = object_config.get("embedding_dim")
+    geometry_dim = geometry_config.get("hidden_dim")
+    if (
+        isinstance(embedding_dim, bool)
+        or not isinstance(embedding_dim, int)
+        or embedding_dim <= 0
+        or isinstance(geometry_dim, bool)
+        or not isinstance(geometry_dim, int)
+        or geometry_dim <= 0
+    ):
+        raise RuntimeError(
+            "DQC merge requires positive integer object/geometry dimensions"
+        )
+    scalar_flags = (
+        quality_config.get("use_roi_coverage"),
+        quality_config.get("use_agent_distance"),
+    )
+    if any(type(flag) is not bool for flag in scalar_flags):
+        raise RuntimeError("DQC merge requires boolean Quality scalar flags")
+    learned_dim = embedding_dim + geometry_dim
+    quality_input_dim = learned_dim + sum(int(flag) for flag in scalar_flags)
+    return learned_dim, quality_input_dim
 
 
 def _normalize_doma_merge_config(doma_config):
@@ -181,6 +329,7 @@ _doma_merge_fingerprint = doma_method_fingerprint
 
 
 def _validate_config_fingerprints(model_dirs):
+    configs = []
     fingerprints = []
     for model_dir in model_dirs:
         config_path = os.path.join(model_dir, "config.yaml")
@@ -188,13 +337,14 @@ def _validate_config_fingerprints(model_dirs):
             raise FileNotFoundError("DOMA merge requires %s" % config_path)
         with open(config_path, "r") as stream:
             hypes = yaml.safe_load(stream)
-        fingerprints.append(
-            doma_method_fingerprint(hypes["model"]["args"]["doma"])
-        )
+        doma_config = hypes["model"]["args"]["doma"]
+        configs.append(doma_config)
+        fingerprints.append(doma_method_fingerprint(doma_config))
     if len(set(fingerprints)) != 1:
         raise RuntimeError(
             "DOMA method configs differ across m2/m3/m4/m1 checkpoints"
         )
+    return configs[0]
 
 
 if __name__ == "__main__":

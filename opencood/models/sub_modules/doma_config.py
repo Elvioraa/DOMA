@@ -16,6 +16,8 @@ VALID_CONSENSUS_MODES = ("uniform_geometry_mean", "quality_weighted")
 VALID_MULTIGRANULAR_FUSIONS = ("concat_projection",)
 VALID_YAW_MODES = ("sin_cos", "sin_cos_centered")
 VALID_PROTOCOL_LOSS_TYPES = ("cosine", "smooth_l1", "mse")
+VALID_STAGE2_CALIBRATION_VARIANTS = ("detached_affine_learned_v1",)
+VALID_QUALITY_DISTANCE_NORMALIZATION_MODES = ("anchor_reference",)
 TOP_LEVEL_KEYS = (
     "enabled",
     "version",
@@ -181,6 +183,60 @@ def validate_doma_config(config):
 
     quality = _required_mapping(config, "quality", "doma.quality")
     quality_enabled = _required_bool(quality, "enabled", "doma.quality.enabled")
+    stage2_calibration = quality.get("stage2_calibration", {})
+    if not isinstance(stage2_calibration, dict):
+        raise TypeError("doma.quality.stage2_calibration must be a mapping")
+    stage2_calibration_enabled = _optional_bool(
+        stage2_calibration,
+        "enabled",
+        False,
+        "doma.quality.stage2_calibration.enabled",
+    )
+    _reject_unknown(
+        stage2_calibration,
+        ("enabled", "variant"),
+        "doma.quality.stage2_calibration",
+    )
+    distance_normalization = quality.get("distance_normalization", {})
+    if not isinstance(distance_normalization, dict):
+        raise TypeError("doma.quality.distance_normalization must be a mapping")
+    distance_normalization_enabled = _optional_bool(
+        distance_normalization,
+        "enabled",
+        False,
+        "doma.quality.distance_normalization.enabled",
+    )
+    _reject_unknown(
+        distance_normalization,
+        ("enabled", "mode", "reference_range"),
+        "doma.quality.distance_normalization",
+    )
+    if stage2_calibration_enabled:
+        if not quality_enabled:
+            raise ValueError(
+                "doma.quality.stage2_calibration requires doma.quality.enabled=true"
+            )
+        if version != "v3":
+            raise ValueError(
+                "doma.quality.stage2_calibration is supported only by DOMA v3"
+            )
+        if (
+            stage2_calibration.get("variant")
+            not in VALID_STAGE2_CALIBRATION_VARIANTS
+        ):
+            raise ValueError(
+                "doma.quality.stage2_calibration.variant must be one of %s"
+                % (VALID_STAGE2_CALIBRATION_VARIANTS,)
+            )
+        if mode == "stage2_adapt" and active_modality == "m1":
+            raise ValueError(
+                "doma.quality.stage2_calibration requires a non-anchor "
+                "Stage2 active_modality"
+            )
+    if distance_normalization_enabled and not quality_enabled:
+        raise ValueError(
+            "doma.quality.distance_normalization requires doma.quality.enabled=true"
+        )
     if quality_enabled:
         _reject_unknown(
             quality,
@@ -192,6 +248,8 @@ def validate_doma_config(config):
                 "use_agent_distance",
                 "detach_target",
                 "detach_weight_for_consensus",
+                "stage2_calibration",
+                "distance_normalization",
             ),
             "doma.quality",
         )
@@ -207,8 +265,34 @@ def validate_doma_config(config):
             _required_bool(quality, key, "doma.quality.%s" % key)
         if quality.get("detach_target") is not True:
             raise ValueError("doma.quality.detach_target must be true")
+        if distance_normalization_enabled:
+            if version != "v3":
+                raise ValueError(
+                    "doma.quality.distance_normalization is supported only by DOMA v3"
+                )
+            if quality.get("use_agent_distance") is not True:
+                raise ValueError(
+                    "doma.quality.distance_normalization requires "
+                    "doma.quality.use_agent_distance=true"
+                )
+            if (
+                distance_normalization.get("mode")
+                not in VALID_QUALITY_DISTANCE_NORMALIZATION_MODES
+            ):
+                raise ValueError(
+                    "doma.quality.distance_normalization.mode must be one of %s"
+                    % (VALID_QUALITY_DISTANCE_NORMALIZATION_MODES,)
+                )
+            _bev_reference_range(
+                distance_normalization.get("reference_range"),
+                "doma.quality.distance_normalization.reference_range",
+            )
     else:
-        _reject_unknown(quality, ("enabled",), "doma.quality")
+        _reject_unknown(
+            quality,
+            ("enabled", "stage2_calibration", "distance_normalization"),
+            "doma.quality",
+        )
 
     protocol_detail_enabled = False
     protocol_context_enabled = False
@@ -658,6 +742,8 @@ def doma_feature_flags(config):
             "multi_granularity": False,
             "context": False,
             "quality": False,
+            "stage2_calibration": False,
+            "quality_distance_normalization": False,
             "object_protocol_alignment": False,
             "quality_aware_refinement": False,
             "quality_aware_refinement_training_loss": False,
@@ -679,6 +765,10 @@ def doma_feature_flags(config):
         and refinement.get("inference_gate", {}).get("enabled") is True
     )
     diagnostics = config.get("delta_iou_diagnostics", {})
+    stage2_calibration = config["quality"].get("stage2_calibration", {})
+    distance_normalization = config["quality"].get(
+        "distance_normalization", {}
+    )
     mode = config["mode"]
     training_mode = mode in VALID_TRAINING_MODES
     qar_training_apply_to = refinement.get("training_loss", {}).get(
@@ -699,6 +789,13 @@ def doma_feature_flags(config):
         "multi_granularity": bool(multi["enabled"]),
         "context": bool(multi.get("enabled") and multi.get("context", {}).get("enabled")),
         "quality": bool(config["quality"]["enabled"]),
+        "stage2_calibration": bool(
+            stage2_calibration.get("enabled") is True
+            and mode in ("stage2_adapt", "inference")
+        ),
+        "quality_distance_normalization": bool(
+            distance_normalization.get("enabled") is True
+        ),
         "object_protocol_alignment": bool(
             protocol.get("enabled") is True
             and config["mode"] == "stage2_adapt"
@@ -868,6 +965,18 @@ def _finite_real(value, name):
     if not math.isfinite(value):
         raise ValueError("%s must be finite" % name)
     return value
+
+
+def _bev_reference_range(value, name):
+    if not isinstance(value, (list, tuple)) or len(value) != 6:
+        raise ValueError("%s must contain six finite values" % name)
+    values = tuple(
+        _finite_real(component, "%s[%d]" % (name, index))
+        for index, component in enumerate(value)
+    )
+    if any(values[index + 3] <= values[index] for index in range(3)):
+        raise ValueError("%s maximum bounds must exceed minimum bounds" % name)
+    return values
 
 
 def _closed_interval(value, lower, upper, name):
