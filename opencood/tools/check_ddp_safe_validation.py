@@ -345,6 +345,91 @@ def _assert_checkpoint_writer():
     assert writer(True, False, 1)
 
 
+def _assert_grad_scaler_step_accounting():
+    unified_grad_scaler = getattr(
+        getattr(torch, 'amp', None), 'GradScaler', None)
+    cuda_grad_scaler = getattr(
+        getattr(torch.cuda, 'amp', None), 'GradScaler', None)
+    if unified_grad_scaler is not None:
+        device = torch.device('cpu')
+        scaler_factory = lambda: unified_grad_scaler('cpu')
+        test_path = 'torch.amp.GradScaler(cpu)'
+    elif torch.cuda.is_available() and cuda_grad_scaler is not None:
+        device = torch.device('cuda')
+        scaler_factory = cuda_grad_scaler
+        test_path = 'torch.cuda.amp.GradScaler(cuda)'
+    else:
+        parameter = nn.Parameter(torch.tensor([1.0]))
+        optimizer = torch.optim.SGD([parameter], lr=0.1)
+        step_count = [0]
+
+        def record_optimizer_step(_optimizer, _args, _kwargs):
+            step_count[0] += 1
+
+        def simulated_scaler_step(found_inf):
+            if not found_inf:
+                optimizer.step()
+
+        hook = optimizer.register_step_post_hook(record_optimizer_step)
+        try:
+            parameter.grad = torch.ones_like(parameter)
+            simulated_scaler_step(found_inf=False)
+            assert step_count[0] == 1
+            step_count[0] = 0
+            # A scaler skip means the underlying optimizer.step is not called.
+            simulated_scaler_step(found_inf=True)
+            assert step_count[0] == 0
+        finally:
+            hook.remove()
+        return {
+            'path': 'optimizer_step_contract_fallback',
+            'real_grad_scaler': False,
+            'normal_step_count': 1,
+            'overflow_skip_step_count': 0,
+        }
+
+    case_counts = {}
+    for case_name, make_nonfinite in (
+            ('normal', False), ('overflow_skip', True)):
+        parameter = nn.Parameter(torch.tensor([1.0], device=device))
+        optimizer = torch.optim.SGD([parameter], lr=0.1)
+        step_count = [0]
+
+        def record_optimizer_step(_optimizer, _args, _kwargs):
+            step_count[0] += 1
+
+        hook = optimizer.register_step_post_hook(record_optimizer_step)
+        try:
+            scaler = scaler_factory()
+            optimizer.zero_grad()
+            if make_nonfinite:
+                loss = (parameter * torch.tensor(
+                    float('inf'), device=device)).sum()
+            else:
+                loss = parameter.square().sum()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            expected_count = 0 if make_nonfinite else 1
+            assert step_count[0] == expected_count
+            case_counts[case_name] = step_count[0]
+        finally:
+            hook.remove()
+            if 'loss' in locals():
+                del loss
+            if 'scaler' in locals():
+                del scaler
+            del optimizer
+            del parameter
+
+    return {
+        'path': test_path,
+        'real_grad_scaler': True,
+        'normal_step_count': case_counts['normal'],
+        'overflow_skip_step_count': case_counts['overflow_skip'],
+    }
+
+
 def _assert_training_log_accounting():
     parameter = nn.Parameter(torch.tensor([1.0]))
     optimizer = torch.optim.SGD([parameter], lr=0.1)
@@ -376,25 +461,9 @@ def _assert_training_log_accounting():
                                   counts['cumulative']))
         assert epoch_results == [(5, 2, 3, 3), (4, 1, 3, 6)]
 
-        counts['epoch'] = 0
-        scaler = torch.amp.GradScaler('cpu')
-        optimizer.zero_grad()
-        overflow_loss = (parameter * torch.tensor(float('inf'))).sum()
-        scaler.scale(overflow_loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        assert counts['epoch'] == 0
-        assert counts['cumulative'] == 6
-
-        optimizer.zero_grad()
-        amp_loss = parameter.square().sum()
-        scaler.scale(amp_loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        assert counts['epoch'] == 1
-        assert counts['cumulative'] == 7
     finally:
         hook.remove()
+    return _assert_grad_scaler_step_accounting()
 
 
 def _assert_optimizer_group_labels():
@@ -501,7 +570,7 @@ def main():
     _assert_none_batch_is_not_counted()
     _assert_gloo_buffer_sync_and_eval_mode()
     _assert_checkpoint_writer()
-    _assert_training_log_accounting()
+    grad_scaler_accounting = _assert_training_log_accounting()
     _assert_optimizer_group_labels()
     _assert_train_ddp_wiring()
     print(json.dumps({
@@ -523,8 +592,7 @@ def main():
         'safe_checkpoint_writers': [0],
         'legacy_checkpoint_writers': [0, 1],
         'epoch_accounting': [[5, 2, 3, 3], [4, 1, 3, 6]],
-        'amp_optimizer_step_hook_count': 1,
-        'amp_overflow_step_hook_count': 0,
+        'grad_scaler_accounting': grad_scaler_accounting,
         'reversed_optimizer_group_labels': ['DOMA', 'Base'],
     }, indent=2))
 
