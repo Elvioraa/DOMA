@@ -121,6 +121,43 @@ def _gloo_buffer_sync_worker(rank, world_size, init_method):
             hook.remove()
         assert output.shape == (1, 2)
         assert not wrapper_forward_called[0]
+
+        training_model = DistributedDataParallel(nn.Linear(1, 1, bias=False))
+        optimizer = torch.optim.SGD(training_model.parameters(), lr=0.1)
+        local_validity = (
+            [True, True, False, False, True]
+            if rank == 0 else
+            [True, False, True, False, True]
+        )
+        expected_decisions = [True, False, False, False, True]
+        decisions = []
+        optimizer_step_count = 0
+
+        for local_valid in local_validity:
+            train_batch_valid = \
+                ddp_safe_utils.all_ranks_have_valid_training_batch(
+                    local_valid, torch.device('cpu'))
+            decisions.append(train_batch_valid)
+            if not train_batch_valid:
+                continue
+
+            optimizer.zero_grad()
+            inputs = torch.tensor([[float(rank + 1)]])
+            targets = torch.tensor([[1.0]])
+            loss = (training_model(inputs) - targets).pow(2).mean()
+            loss.backward()
+            optimizer.step()
+            optimizer_step_count += 1
+
+        assert decisions == expected_decisions
+        assert optimizer_step_count == 2
+
+        parameters = training_model.module.weight.detach()
+        gathered_parameters = [torch.zeros_like(parameters)
+                               for _ in range(world_size)]
+        dist.all_gather(gathered_parameters, parameters)
+        assert all(torch.equal(gathered_parameters[0], parameter)
+                   for parameter in gathered_parameters[1:])
     finally:
         dist.destroy_process_group()
 
@@ -161,6 +198,31 @@ def _mock_reducer(peer_loss_sum, peer_count):
                                dtype=totals.dtype,
                                device=totals.device)
     return all_reduce
+
+
+def _mock_min_reducer(peer_valid):
+    def all_reduce(validity, op):
+        assert op == torch.distributed.ReduceOp.MIN
+        peer = torch.tensor([int(peer_valid)],
+                            dtype=validity.dtype,
+                            device=validity.device)
+        validity.copy_(torch.minimum(validity, peer))
+    return all_reduce
+
+
+def _assert_training_batch_validity():
+    cases = (
+        (True, True, True),
+        (True, False, False),
+        (False, True, False),
+        (False, False, False),
+    )
+    for local_valid, peer_valid, expected in cases:
+        actual = ddp_safe_utils.all_ranks_have_valid_training_batch(
+            local_valid,
+            torch.device('cpu'),
+            _mock_min_reducer(peer_valid))
+        assert actual is expected
 
 
 def _assert_global_sum_count():
@@ -294,6 +356,7 @@ def _assert_train_ddp_wiring():
         'DistributedEvalSampler(',
         'checkpoint_writer_enabled(',
         'sync_module_buffers_from_rank0(',
+        'all_ranks_have_valid_training_batch(',
         'reduce_validation_sum_count(',
         'validation_model = model_without_ddp if ddp_safe_active else model',
         'model.eval()',
@@ -309,6 +372,19 @@ def _assert_train_ddp_wiring():
         assert token in source, token
     assert 'dist.all_reduce(totals, op=dist.ReduceOp.SUM)' in helper_source
     assert 'dist.broadcast(buffer, src=0)' in helper_source
+    assert 'dist.all_reduce(validity, op=dist.ReduceOp.MIN)' in helper_source
+
+    training_loop = source.index(
+        'for i, batch_data in enumerate(train_loader):')
+    validity_collective = source.index(
+        'ddp_safe_utils.all_ranks_have_valid_training_batch(', training_loop)
+    synchronized_skip = source.index(
+        'if not train_batch_valid:', validity_collective)
+    training_forward = source.index(
+        "ouput_dict = model(batch_data['ego'])", synchronized_skip)
+    assert (training_loop < validity_collective < synchronized_skip <
+            training_forward)
+    assert 'continue' not in source[training_loop:validity_collective]
 
     eval_event = source.index(
         "if epoch % hypes['train_params']['eval_freq'] == 0:")
@@ -323,6 +399,7 @@ def _assert_train_ddp_wiring():
 
 def main():
     _assert_config_parsing()
+    _assert_training_batch_validity()
     _assert_global_sum_count()
     _assert_nonpadding_validation_shards()
     _assert_dataloader_preserves_tail_batch()
@@ -334,6 +411,10 @@ def main():
         'status': 'PASS',
         'safe_mode_default': False,
         'mock_world_size': 2,
+        'training_validity_cases': [True, False, False, False],
+        'gloo_training_decisions': [True, False, False, False, True],
+        'gloo_optimizer_steps_per_rank': 2,
+        'gloo_final_parameters_synchronized': True,
         'global_validation_loss': 3.0,
         'dataloader_indices': [0, 1, 2, 3, 4],
         'rank0_tail_batch': [4],

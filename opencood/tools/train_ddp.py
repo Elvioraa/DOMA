@@ -199,7 +199,17 @@ def main():
         except:
             print("No model_train_init function")
         for i, batch_data in enumerate(train_loader):
-            if batch_data is None or batch_data['ego']['object_bbx_mask'].sum()==0:
+            local_batch_valid = batch_data is not None
+            if local_batch_valid:
+                local_batch_valid = (
+                    batch_data['ego']['object_bbx_mask'].sum().item() != 0)
+            if opt.distributed:
+                train_batch_valid = \
+                    ddp_safe_utils.all_ranks_have_valid_training_batch(
+                        local_batch_valid, device)
+            else:
+                train_batch_valid = local_batch_valid
+            if not train_batch_valid:
                 continue
             model.zero_grad()
             optimizer.zero_grad()

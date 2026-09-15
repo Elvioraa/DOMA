@@ -67,6 +67,22 @@ def sync_module_buffers_from_rank0(module):
             dist.broadcast(buffer, src=0)
 
 
+def all_ranks_have_valid_training_batch(local_valid, device,
+                                        all_reduce=None):
+    """Return true only when every distributed rank has a valid batch."""
+    if type(local_valid) is not bool:
+        raise TypeError('local_valid must be a boolean')
+
+    validity = torch.tensor([int(local_valid)],
+                            dtype=torch.int32,
+                            device=device)
+    if all_reduce is None:
+        dist.all_reduce(validity, op=dist.ReduceOp.MIN)
+    else:
+        all_reduce(validity, op=dist.ReduceOp.MIN)
+    return validity.item() == 1
+
+
 def reduce_validation_sum_count(local_loss_sum, local_count, device,
                                 all_reduce=None):
     """Reduce validation loss by global sum/count, not mean-of-rank-means."""
