@@ -34,6 +34,53 @@ def train_parser():
     return opt
 
 
+def _optimizer_group_labels(optimizer, model):
+    """Identify optimizer groups for logging without relying on group order."""
+    parameter_names = {
+        id(parameter): name
+        for name, parameter in model.named_parameters()
+    }
+    labels = []
+    used_labels = set()
+    for group_index, param_group in enumerate(optimizer.param_groups):
+        explicit_label = param_group.get(
+            'name', param_group.get('group_name'))
+        if explicit_label is not None:
+            label = str(explicit_label)
+        else:
+            names = [
+                parameter_names.get(id(parameter))
+                for parameter in param_group['params']
+            ]
+            known_names = [name for name in names if name is not None]
+            if (known_names and len(known_names) == len(names) and
+                    all(name.startswith('doma_') for name in known_names)):
+                label = 'DOMA'
+            elif (known_names and len(known_names) == len(names) and
+                  all(not name.startswith('doma_')
+                      for name in known_names)):
+                label = 'Base'
+            elif len(optimizer.param_groups) == 1:
+                label = 'All'
+            else:
+                label = 'Group%d' % group_index
+        if label in used_labels:
+            label = '%s[%d]' % (label, group_index)
+        used_labels.add(label)
+        labels.append(label)
+    return labels
+
+
+def _print_optimizer_groups(optimizer, group_labels):
+    print('[Optimizer Groups]')
+    for label, param_group in zip(group_labels, optimizer.param_groups):
+        print('{}: lr={:.6f}, weight_decay={}'.format(
+            label,
+            float(param_group['lr']),
+            param_group.get('weight_decay',
+                            optimizer.defaults.get('weight_decay', 0.0))))
+
+
 def main():
     opt = train_parser()
     hypes = yaml_utils.load_yaml(opt.hypes_yaml, opt)
@@ -174,6 +221,17 @@ def main():
     optimizer = train_utils.setup_optimizer(hypes, model_without_ddp)
     
     scheduler = train_utils.setup_lr_schedular(hypes, optimizer, init_epoch=init_epoch)
+    optimizer_group_labels = _optimizer_group_labels(
+        optimizer, model_without_ddp)
+    optimizer_step_counts = {'epoch': 0, 'cumulative': 0}
+
+    def record_optimizer_step(_optimizer, _args, _kwargs):
+        optimizer_step_counts['epoch'] += 1
+        optimizer_step_counts['cumulative'] += 1
+
+    optimizer.register_step_post_hook(record_optimizer_step)
+    if rank == 0:
+        _print_optimizer_groups(optimizer, optimizer_group_labels)
 
     # record training
     writer = SummaryWriter(saved_path)
@@ -188,8 +246,17 @@ def main():
     # used to help schedule learning rate
 
     for epoch in range(init_epoch, max(epoches, init_epoch)):
-        for param_group in optimizer.param_groups:
-            print('learning rate %f' % param_group["lr"])
+        loader_iterations = 0
+        skipped_iterations = 0
+        optimizer_step_counts['epoch'] = 0
+        if rank == 0:
+            current_lrs = [
+                '{}={:.6f}'.format(label, float(param_group['lr']))
+                for label, param_group in zip(
+                    optimizer_group_labels, optimizer.param_groups)
+            ]
+            print('[LR][epoch %d][before training] %s' %
+                  (epoch, ' | '.join(current_lrs)))
         if opt.distributed:
             sampler_train.set_epoch(epoch)
         # the model will be evaluation mode during validation
@@ -199,6 +266,7 @@ def main():
         except:
             print("No model_train_init function")
         for i, batch_data in enumerate(train_loader):
+            loader_iterations += 1
             local_batch_valid = batch_data is not None
             if local_batch_valid:
                 local_batch_valid = (
@@ -210,6 +278,7 @@ def main():
             else:
                 train_batch_valid = local_batch_valid
             if not train_batch_valid:
+                skipped_iterations += 1
                 continue
             model.zero_grad()
             optimizer.zero_grad()
@@ -242,6 +311,14 @@ def main():
                 scaler.step(optimizer)
                 scaler.update()
 
+        if rank == 0:
+            print('[DDP Train Epoch Summary]')
+            print('epoch=%d' % epoch)
+            print('loader_iterations=%d' % loader_iterations)
+            print('skipped_iterations=%d' % skipped_iterations)
+            print('optimizer_steps=%d' % optimizer_step_counts['epoch'])
+            print('cumulative_optimizer_steps=%d' %
+                  optimizer_step_counts['cumulative'])
 
         # torch.cuda.empty_cache() # it will destroy memory buffer
         if epoch % hypes['train_params']['save_freq'] == 0:

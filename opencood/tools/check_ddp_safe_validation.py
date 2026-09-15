@@ -1,5 +1,6 @@
 """CPU/mock checks for the opt-in DDP-safe validation path."""
 
+import ast
 import inspect
 import json
 import os
@@ -344,6 +345,92 @@ def _assert_checkpoint_writer():
     assert writer(True, False, 1)
 
 
+def _assert_training_log_accounting():
+    parameter = nn.Parameter(torch.tensor([1.0]))
+    optimizer = torch.optim.SGD([parameter], lr=0.1)
+    counts = {'epoch': 0, 'cumulative': 0}
+
+    def record_optimizer_step(_optimizer, _args, _kwargs):
+        counts['epoch'] += 1
+        counts['cumulative'] += 1
+
+    hook = optimizer.register_step_post_hook(record_optimizer_step)
+    try:
+        epoch_results = []
+        for validity in ([True, False, True, False, True],
+                         [True, False, True, True]):
+            loader_iterations = 0
+            skipped_iterations = 0
+            counts['epoch'] = 0
+            for train_batch_valid in validity:
+                loader_iterations += 1
+                if not train_batch_valid:
+                    skipped_iterations += 1
+                    continue
+                optimizer.zero_grad()
+                parameter.grad = torch.ones_like(parameter)
+                optimizer.step()
+            epoch_results.append((loader_iterations,
+                                  skipped_iterations,
+                                  counts['epoch'],
+                                  counts['cumulative']))
+        assert epoch_results == [(5, 2, 3, 3), (4, 1, 3, 6)]
+
+        counts['epoch'] = 0
+        scaler = torch.amp.GradScaler('cpu')
+        optimizer.zero_grad()
+        overflow_loss = (parameter * torch.tensor(float('inf'))).sum()
+        scaler.scale(overflow_loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        assert counts['epoch'] == 0
+        assert counts['cumulative'] == 6
+
+        optimizer.zero_grad()
+        amp_loss = parameter.square().sum()
+        scaler.scale(amp_loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        assert counts['epoch'] == 1
+        assert counts['cumulative'] == 7
+    finally:
+        hook.remove()
+
+
+def _assert_optimizer_group_labels():
+    tools_dir = os.path.dirname(os.path.abspath(__file__))
+    train_ddp_path = os.path.join(tools_dir, 'train_ddp.py')
+    with open(train_ddp_path, 'r', encoding='utf-8') as source_file:
+        syntax_tree = ast.parse(source_file.read())
+    label_function = next(
+        node for node in syntax_tree.body
+        if isinstance(node, ast.FunctionDef) and
+        node.name == '_optimizer_group_labels')
+    namespace = {}
+    exec(compile(ast.Module(body=[label_function], type_ignores=[]),
+                 train_ddp_path, 'exec'), namespace)
+    identify = namespace['_optimizer_group_labels']
+
+    class OptimizerGroupToy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base = nn.Linear(2, 2)
+            self.doma_probe = nn.Linear(2, 1)
+
+    model = OptimizerGroupToy()
+    reversed_optimizer = torch.optim.Adam([
+        {'params': model.doma_probe.parameters(), 'weight_decay': 0.0},
+        {'params': model.base.parameters(), 'weight_decay': 1e-4},
+    ], lr=1e-3)
+    assert identify(reversed_optimizer, model) == ['DOMA', 'Base']
+
+    named_optimizer = torch.optim.Adam([
+        {'params': model.base.parameters(), 'name': 'Backbone'},
+        {'params': model.doma_probe.parameters(), 'name': 'Adapters'},
+    ], lr=1e-3)
+    assert identify(named_optimizer, model) == ['Backbone', 'Adapters']
+
+
 def _assert_train_ddp_wiring():
     tools_dir = os.path.dirname(os.path.abspath(__file__))
     train_ddp_path = os.path.join(tools_dir, 'train_ddp.py')
@@ -367,6 +454,14 @@ def _assert_train_ddp_wiring():
         'checkpoint_writer=rank0',
         'validation_reduction=global_sum_count',
         'statistics.mean(valid_ave_loss)',
+        'optimizer.register_step_post_hook(record_optimizer_step)',
+        'loader_iterations += 1',
+        'skipped_iterations += 1',
+        "optimizer_step_counts['epoch']",
+        "optimizer_step_counts['cumulative']",
+        '[Optimizer Groups]',
+        '[DDP Train Epoch Summary]',
+        '[before training]',
     )
     for token in required_train_tokens:
         assert token in source, token
@@ -406,6 +501,8 @@ def main():
     _assert_none_batch_is_not_counted()
     _assert_gloo_buffer_sync_and_eval_mode()
     _assert_checkpoint_writer()
+    _assert_training_log_accounting()
+    _assert_optimizer_group_labels()
     _assert_train_ddp_wiring()
     print(json.dumps({
         'status': 'PASS',
@@ -425,6 +522,10 @@ def main():
         'validation_forward_uses_underlying_module': True,
         'safe_checkpoint_writers': [0],
         'legacy_checkpoint_writers': [0, 1],
+        'epoch_accounting': [[5, 2, 3, 3], [4, 1, 3, 6]],
+        'amp_optimizer_step_hook_count': 1,
+        'amp_overflow_step_hook_count': 0,
+        'reversed_optimizer_group_labels': ['DOMA', 'Base'],
     }, indent=2))
 
 
