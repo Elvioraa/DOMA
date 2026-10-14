@@ -1,4 +1,5 @@
 import argparse
+from contextlib import ExitStack
 import os
 import statistics
 import glob
@@ -82,9 +83,22 @@ def _print_optimizer_groups(optimizer, group_labels):
 
 
 def main():
+    with ExitStack() as resources:
+        _main(resources)
+
+
+def _main(resources):
     opt = train_parser()
     hypes = yaml_utils.load_yaml(opt.hypes_yaml, opt)
+    from opencood.tools.dair_protocol import enabled, validate_protocol
+    dair_config = hypes if enabled(hypes) else None
+    if dair_config is not None:
+        validate_protocol(hypes)
+        if hypes['dair_protocol']['stage'] == 'stage2' and not opt.model_dir:
+            raise RuntimeError('Prepare Stage2 with an explicit verified Stage1 source first')
     multi_gpu_utils.init_distributed_mode(opt)
+    if dist.is_initialized():
+        resources.callback(dist.destroy_process_group)
     seed = seed_utils.seed_from_hypes(hypes)
     rank = opt.rank if opt.distributed else 0
     ddp_safe_enabled = ddp_safe_utils.ddp_safe_validation_enabled(hypes)
@@ -95,6 +109,10 @@ def main():
     opencood_validate_dataset = build_dataset(hypes,
                                               visualize=False,
                                               train=False)
+
+    if dair_config is not None:
+        if len(opencood_train_dataset) != 4811 or len(opencood_validate_dataset) != 1789:
+            raise RuntimeError('DAIR split sample counts differ from the approved protocol')
 
     if opt.distributed:
         sampler_seed_kwargs = seed_utils.distributed_sampler_seed_kwargs(seed)
@@ -180,7 +198,7 @@ def main():
     # if we want to train from last checkpoint.
     if opt.model_dir:
         saved_path = opt.model_dir
-        init_epoch, model = train_utils.load_saved_model(saved_path, model)
+        init_epoch, model = train_utils.load_saved_model(saved_path, model, dair_config=dair_config)
         lowest_val_epoch = init_epoch
     else:
         init_epoch = 0
@@ -235,6 +253,7 @@ def main():
 
     # record training
     writer = SummaryWriter(saved_path)
+    resources.callback(writer.close)
 
     # half precision training
     if opt.half:
@@ -261,10 +280,8 @@ def main():
             sampler_train.set_epoch(epoch)
         # the model will be evaluation mode during validation
         model.train()
-        try: # heter_model stage2
+        if hasattr(model_without_ddp, 'model_train_init'):
             model_without_ddp.model_train_init()
-        except:
-            print("No model_train_init function")
         for i, batch_data in enumerate(train_loader):
             loader_iterations += 1
             local_batch_valid = batch_data is not None
@@ -420,10 +437,11 @@ def main():
 
     if ddp_safe_active:
         dist.barrier()
+    resources.close()
     print('Training Finished, checkpoints saved to %s' % saved_path)
 
     if opt.rank == 0:
-        run_test = True
+        run_test = hypes['train_params'].get('run_inference_after_training', True)
         
         # ddp training may leave multiple bestval
         bestval_model_list = glob.glob(os.path.join(saved_path, "net_epoch_bestval_at*"))

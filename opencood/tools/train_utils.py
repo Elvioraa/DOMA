@@ -52,7 +52,7 @@ def check_missing_key(model_state_dict, ckpt_state_dict):
     print("--------------------------------")
 
 
-def load_saved_model(saved_path, model, checkpoint_path=None):
+def load_saved_model(saved_path, model, checkpoint_path=None, dair_config=None):
     """
     Load saved model if exiseted
 
@@ -69,6 +69,13 @@ def load_saved_model(saved_path, model, checkpoint_path=None):
         The model instance loaded pretrained params.
     """
     assert os.path.exists(saved_path), '{} not found'.format(saved_path)
+
+    def load_state(state, path):
+        if dair_config is not None:
+            from opencood.tools.dair_protocol import load_training_state
+            load_training_state(model, state, saved_path, path, dair_config)
+        else:
+            model.load_state_dict(state, strict=False)
 
     if checkpoint_path is not None:
         if not os.path.isabs(checkpoint_path):
@@ -91,7 +98,7 @@ def load_saved_model(saved_path, model, checkpoint_path=None):
               checkpoint_epoch)
         loaded_state_dict = torch.load(checkpoint_path, map_location='cpu')
         check_missing_key(model.state_dict(), loaded_state_dict)
-        model.load_state_dict(loaded_state_dict, strict=False)
+        load_state(loaded_state_dict, checkpoint_path)
         return checkpoint_epoch, model
 
     def findLastCheckpoint(save_dir):
@@ -124,7 +131,7 @@ def load_saved_model(saved_path, model, checkpoint_path=None):
                 bestval_epoch)
         loaded_state_dict = torch.load(file_list[0] , map_location='cpu')
         check_missing_key(model.state_dict(), loaded_state_dict)
-        model.load_state_dict(loaded_state_dict, strict=False)
+        load_state(loaded_state_dict, file_list[0])
         return bestval_epoch, model
 
     initial_epoch = findLastCheckpoint(saved_path)
@@ -133,7 +140,9 @@ def load_saved_model(saved_path, model, checkpoint_path=None):
         loaded_state_dict = torch.load(os.path.join(saved_path,
                          'net_epoch%d.pth' % initial_epoch), map_location='cpu')
         check_missing_key(model.state_dict(), loaded_state_dict)
-        model.load_state_dict(loaded_state_dict, strict=False)
+        load_state(loaded_state_dict, os.path.join(saved_path, 'net_epoch%d.pth' % initial_epoch))
+    elif dair_config is not None and dair_config['dair_protocol']['stage'] == 'stage2':
+        raise RuntimeError('DAIR Stage2 requires verified Stage1 initialization')
 
     return initial_epoch, model
 

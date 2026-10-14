@@ -3,6 +3,7 @@
 # License: TDG-Attribution-NonCommercial-NoDistrib
 
 import argparse
+from contextlib import ExitStack
 import os
 import statistics
 import uuid
@@ -31,8 +32,19 @@ def train_parser():
 
 
 def main():
+    with ExitStack() as resources:
+        _main(resources)
+
+
+def _main(resources):
     opt = train_parser()
     hypes = yaml_utils.load_yaml(opt.hypes_yaml, opt)
+    from opencood.tools.dair_protocol import enabled, validate_protocol
+    dair_config = hypes if enabled(hypes) else None
+    if dair_config is not None:
+        validate_protocol(hypes)
+        if hypes['dair_protocol']['stage'] == 'stage2' and not opt.model_dir:
+            raise RuntimeError('Prepare Stage2 with an explicit verified Stage1 source first')
     seed = seed_utils.seed_from_hypes(hypes)
     checkpoint_selection = \
         validation_detection.get_checkpoint_selection_config(hypes)
@@ -42,6 +54,10 @@ def main():
     opencood_validate_dataset = build_dataset(hypes,
                                               visualize=False,
                                               train=False)
+    if dair_config is not None:
+        if len(opencood_train_dataset) != 4811 or len(opencood_validate_dataset) != 1789:
+            raise RuntimeError('DAIR split sample counts differ from the approved protocol')
+
     detection_val_loader = None
     if checkpoint_selection["enabled"]:
         validation_detection.validate_fusion_method(opt.fusion_method)
@@ -87,7 +103,7 @@ def main():
     # if we want to train from last checkpoint.
     if opt.model_dir:
         saved_path = opt.model_dir
-        init_epoch, model = train_utils.load_saved_model(saved_path, model)
+        init_epoch, model = train_utils.load_saved_model(saved_path, model, dair_config=dair_config)
         lowest_val_epoch = init_epoch
         scheduler = train_utils.setup_lr_schedular(hypes, optimizer, init_epoch=init_epoch)
         print(f"resume from {init_epoch} epoch.")
@@ -117,6 +133,7 @@ def main():
         
     # record training
     writer = SummaryWriter(saved_path)
+    resources.callback(writer.close)
 
     print('Training start')
     epoches = hypes['train_params']['epoches']
@@ -128,10 +145,8 @@ def main():
             print('learning rate %f' % param_group["lr"])
         # the model will be evaluation mode during validation
         model.train()
-        try: # heter_model stage2
+        if hasattr(model, 'model_train_init'):
             model.model_train_init()
-        except:
-            print("No model_train_init function")
         for i, batch_data in enumerate(train_loader):
             if batch_data is None or batch_data['ego']['object_bbx_mask'].sum()==0:
                 continue
@@ -267,9 +282,10 @@ def main():
 
         opencood_train_dataset.reinitialize()
 
+    resources.close()
     print('Training Finished, checkpoints saved to %s' % saved_path)
 
-    run_test = True
+    run_test = hypes['train_params'].get('run_inference_after_training', True)
     if run_test:
         if (checkpoint_selection["enabled"] and
                 (not checkpoint_selection["save_bestdet"] or

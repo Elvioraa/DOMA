@@ -40,27 +40,34 @@ def apply_doma_merge_ownership(
     require_dqc_calibrators=None,
     dqc_dimensions=None,
 ):
-    """Overlay DOMA keys for checkpoints ordered as m2, m3, m4, Stage1 m1."""
+    """Overlay DOMA keys for m2,m1 (DAIR) or m2,m3,m4,m1 (legacy)."""
     has_doma_parameters = any(
         key.startswith("doma_")
         for state_dict in ordered_stage_dicts
         for key in state_dict
     )
     if not has_doma_parameters:
+        if len(ordered_stage_dicts) == 2:
+            raise RuntimeError("Two-checkpoint DOMA merge requires DOMA parameters")
         if require_dqc_calibrators is True:
             raise RuntimeError(
                 "DQC-enabled merge requires DOMA and calibrator checkpoint keys"
             )
         return merged_dict
-    if len(ordered_stage_dicts) != 4:
-        raise RuntimeError("DOMA merge_final requires m2, m3, m4, m1 order")
-
-    stage2_by_modality = {
-        "m2": ordered_stage_dicts[0],
-        "m3": ordered_stage_dicts[1],
-        "m4": ordered_stage_dicts[2],
-    }
-    stage1 = ordered_stage_dicts[3]
+    if len(ordered_stage_dicts) not in (2, 4):
+        raise RuntimeError("DOMA merge_final requires m2,m1 or m2,m3,m4,m1 order")
+    modalities = ("m2",) if len(ordered_stage_dicts) == 2 else ("m2", "m3", "m4")
+    stage2_by_modality = dict(zip(modalities, ordered_stage_dicts[:-1]))
+    stage1 = ordered_stage_dicts[-1]
+    if len(ordered_stage_dicts) == 2:
+        from opencood.tools.dair_protocol import assert_shared_equal, FRONT1, FRONT2
+        source = ordered_stage_dicts[0]
+        assert_shared_equal(stage1, source)
+        if any(k.startswith(FRONT1) for k in source):
+            raise RuntimeError("DAIR Stage2 must not contain m1 frontends")
+        for key in set(source) - set(stage1):
+            if not key.startswith(FRONT2):
+                raise RuntimeError("Unexpected DAIR Stage2 ownership: " + key)
     has_dqc_calibrators = any(
         key.startswith(DQC_CALIBRATOR_PREFIX)
         for state_dict in ordered_stage_dicts
@@ -159,9 +166,23 @@ def apply_doma_merge_ownership(
 
 def merge_and_save_final(aligned_model_dir_list, output_model_dir):
     """Run Official HEAL merge order, then enforce DOMA ownership."""
-    if len(aligned_model_dir_list) != 4:
-        raise ValueError("expected model directories in m2, m3, m4, m1 order")
+    if len(aligned_model_dir_list) not in (2, 4):
+        raise ValueError("expected model directories in m2,m1 or m2,m3,m4,m1 order")
     doma_config = _validate_config_fingerprints(aligned_model_dir_list)
+    if len(aligned_model_dir_list) == 2:
+        from opencood.tools.dair_protocol import raw_config, validate_protocol, verify_provenance, digest
+        from pathlib import Path
+        from opencood.tools.dair_workflow import merge
+        stage2_cfg = validate_protocol(raw_config(os.path.join(aligned_model_dir_list[0], "config.yaml")), "stage2")
+        validate_protocol(raw_config(os.path.join(aligned_model_dir_list[1], "config.yaml")), "stage1")
+        provenance = verify_provenance(aligned_model_dir_list[0], stage2_cfg)
+        if digest(get_model_path_from_dir(aligned_model_dir_list[1])) != provenance["checkpoint_sha256"]:
+            raise RuntimeError("Merge Stage1 differs from recorded inheritance source")
+        final_config = (Path(__file__).resolve().parents[1] / "hypes_yaml/dairv2x/MoreModality/DAIR_PROTOCOL/DOMA"
+                        / stage2_cfg["dair_protocol"]["experiment"] / "final_m1m2/config.yaml")
+        merge(final_config, aligned_model_dir_list[0],
+              get_model_path_from_dir(aligned_model_dir_list[0]), output_model_dir)
+        return os.path.join(output_model_dir, "net_epoch1.pth")
     require_dqc_calibrators = bool(
         doma_config.get("quality", {})
         .get("stage2_calibration", {})
@@ -351,6 +372,6 @@ if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] != "merge_final":
         raise SystemExit(
             "usage: python -m opencood.tools.doma_tools merge_final "
-            "<m2_dir> <m3_dir> <m4_dir> <m1_dir> <output_dir>"
+            "<m2_dir> [<m3_dir> <m4_dir>] <m1_dir> <output_dir>"
         )
     merge_and_save_final(sys.argv[2:-1], sys.argv[-1])
