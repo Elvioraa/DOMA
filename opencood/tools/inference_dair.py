@@ -93,7 +93,7 @@ def _checkpoint_epoch(checkpoint):
 
 def _infer_info(cfg, checkpoint):
     # DAIR uses the native heter Dataset, without ordered inference's use_cav control.
-    fusion_method = cfg['fusion']['core_method'].removesuffix('heter')
+    fusion_method = re.sub(r'heter$', '', cfg['fusion']['core_method'])
     lidar_range = cfg['cav_lidar_range']
     return f"{fusion_method}_{lidar_range[3]}_{lidar_range[4]}_epoch{_checkpoint_epoch(checkpoint)}"
 
