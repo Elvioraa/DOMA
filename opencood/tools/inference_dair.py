@@ -1,6 +1,7 @@
 """Native DAIR validation for HEAL/DOMA; no ordered-assignment overrides."""
 import argparse
 import json
+import re
 from pathlib import Path
 
 from opencood.tools.dair_protocol import digest, load_state, require, validate_protocol, raw_config
@@ -79,8 +80,22 @@ def write_effective_protocol(cfg, config_path, directory, checkpoint, max_sample
     payload = _report_json(report)
     destination = Path(directory) / 'protocol_effective.json'
     destination.write_text(payload, encoding='utf8')
-    print(payload, end='', flush=True)
+    print(f'Effective protocol saved to {destination}', flush=True)
     return report
+
+
+def _checkpoint_epoch(checkpoint):
+    # Same filename epoch convention as HEAL load_saved_model; no source substitution.
+    match = re.fullmatch(r'net_epoch(?:_bestval_at)?(\d+)\.pth',
+                         str(checkpoint).replace('\\', '/').rsplit('/', 1)[-1])
+    return match.group(1) if match else 'unknown'
+
+
+def _infer_info(cfg, checkpoint):
+    # DAIR uses the native heter Dataset, without ordered inference's use_cav control.
+    fusion_method = cfg['fusion']['core_method'].removesuffix('heter')
+    lidar_range = cfg['cav_lidar_range']
+    return f"{fusion_method}_{lidar_range[3]}_{lidar_range[4]}_epoch{_checkpoint_epoch(checkpoint)}"
 
 
 def main():
@@ -112,6 +127,13 @@ def main():
     require(digest(checkpoint) == provenance['final_checkpoint_sha256'], 'Final checkpoint changed after merge')
     model = train_utils.create_model(cfg)
     model.load_state_dict(load_state(checkpoint), strict=True)
+    infer_info = _infer_info(cfg, checkpoint)
+    print(f'Loaded checkpoint: {checkpoint} (file epoch {_checkpoint_epoch(checkpoint)})', flush=True)
+    source = provenance.get('stage2_checkpoint')
+    if source is not None:
+        print(f'Stage2 source checkpoint: {source} (file epoch {_checkpoint_epoch(source)})', flush=True)
+    else:
+        print('Stage2 source checkpoint: not recorded', flush=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device).eval()
     dataset = build_dataset(cfg, visualize=True, train=False)
@@ -124,7 +146,8 @@ def main():
     processed, skipped = 0, 0
     agent_counts = {}
     with torch.no_grad():
-        for batch in loader:
+        for i, batch in enumerate(loader):
+            print(f"{infer_info}_{i}", flush=True)
             if batch is None:
                 skipped += 1
                 continue
@@ -156,7 +179,7 @@ def main():
     report['raw_postprocess'] = _field(raw_config(config_path), 'postprocess')
     payload = _report_json(report)
     (directory / ('protocol_' + label + '.json')).write_text(payload, encoding='utf8')
-    print(payload, end='')
+    print(f"Validation protocol saved to {directory / ('protocol_' + label + '.json')}", flush=True)
 
 
 if __name__ == '__main__':
