@@ -84,8 +84,11 @@ class Adaptor:
 
     def switch_lidar_channels(self, cav_modality, lidar_file_path):
         """
-        Currently only support OPV2V
+        Channel-specific point clouds are only available for OPV2V.
         """
+        if "OPV2V" not in lidar_file_path.replace("\\", "/").split("/"):
+            return lidar_file_path
+
         if self.lidar_channels_dict.get(cav_modality, None) == 32:
             return lidar_file_path.replace("OPV2V","OPV2V_Hetero").replace(".pcd", "_32.pcd")
         if self.lidar_channels_dict.get(cav_modality, None) == 16:
