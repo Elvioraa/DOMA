@@ -2,15 +2,37 @@
 # Author: Yifan Lu <yifan_lu@sjtu.edu.cn>
 # License: TDG-Attribution-NonCommercial-NoDistrib
 
+import hashlib
 import numpy as np
 import torch
 import torch.distributions as dist
 
-def add_noise_data_dict(data_dict, noise_setting):
+def add_eval_pose_noise(data_dict, xy_std, yaw_std, seed, sample_idx):
+    """Perturb reported poses in metres/degrees, retaining clean label poses."""
+    for cav_id, content in data_dict.items():
+        # Some base datasets share params with an in-memory scene cache.
+        params = content['params'].copy()
+        data_dict[cav_id] = dict(content, params=params)
+        clean = params['lidar_pose']
+        params['lidar_pose_clean'] = clean
+        if content['ego'] or (xy_std == 0 and yaw_std == 0):
+            continue
+        # A stable per-agent stream, independent of Python's hash seed and workers.
+        key = f'{seed}/{sample_idx}/{cav_id}'.encode('utf-8')
+        rng_seed = int.from_bytes(hashlib.sha256(key).digest()[:4], 'little')
+        rng = np.random.RandomState(rng_seed)
+        noise = np.zeros(6)
+        noise[[0, 1, 4]] = rng.standard_normal(3) * [xy_std, xy_std, yaw_std]
+        params['lidar_pose'] = np.asarray(clean) + noise
+    return data_dict
+
+def add_noise_data_dict(data_dict, noise_setting, sample_idx=None):
     """ Update the base data dict. 
         We retrieve lidar_pose and add_noise to it.
         And set a clean pose.
     """
+    if 'eval_pose_noise' in noise_setting:
+        return add_eval_pose_noise(data_dict, *noise_setting['eval_pose_noise'], sample_idx)
     if noise_setting['add_noise']:
         for cav_id, cav_content in data_dict.items():
             cav_content['params']['lidar_pose_clean'] = cav_content['params']['lidar_pose'] # 6 dof pose

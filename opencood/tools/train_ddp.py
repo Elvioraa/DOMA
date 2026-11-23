@@ -92,6 +92,8 @@ def _main(resources):
     hypes = yaml_utils.load_yaml(opt.hypes_yaml, opt)
     from opencood.tools.dair_protocol import enabled, validate_protocol
     dair_config = hypes if enabled(hypes) else None
+    from opencood.tools import dair_post_training
+    dair_post_training.is_enabled(hypes)  # Validate the opt-in before training.
     if dair_config is not None:
         validate_protocol(hypes)
         if hypes['dair_protocol']['stage'] == 'stage2' and not opt.model_dir:
@@ -441,6 +443,10 @@ def _main(resources):
     print('Training Finished, checkpoints saved to %s' % saved_path)
 
     if opt.rank == 0:
+        if dair_post_training.run_bestval_ap(
+                hypes, saved_path, lowest_val_epoch, model_without_ddp,
+                opencood_validate_dataset, device):
+            return
         run_test = hypes['train_params'].get('run_inference_after_training', True)
         
         # ddp training may leave multiple bestval

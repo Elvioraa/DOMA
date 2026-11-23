@@ -1,0 +1,245 @@
+{
+  "status": "DEPLOYED_CHECK_BLOCKED_GPU2",
+  "date": "2026-10-13",
+  "target": "/home/fkk/my_data/disk2/code/DOMA",
+  "deployed": true,
+  "gpu": [
+    0,
+    2
+  ],
+  "nproc_per_node": 2,
+  "base_commit": "faa096039531fc0875c6a9bf250b9432b4e86a4e",
+  "worktree_git_diff_empty": true,
+  "live_history_configs_matched": 15,
+  "extension_configs_verified": 20,
+  "runtime_hashes": {
+    "opencood/models/sub_modules/doma_object.py": {
+      "original": "f2cc1530ee0ce4351520924653979cdffe2da9846e07ccd844296daa9648b005",
+      "worktree": "f2cc1530ee0ce4351520924653979cdffe2da9846e07ccd844296daa9648b005"
+    },
+    "opencood/models/sub_modules/doma_config.py": {
+      "original": "01989a97d1b1f6730f023b54ad21e01d0feec2925e5b302366da97ec290f4ef6",
+      "worktree": "01989a97d1b1f6730f023b54ad21e01d0feec2925e5b302366da97ec290f4ef6"
+    },
+    "opencood/loss/doma_object_loss.py": {
+      "original": "b159e89b89f117b2fb34f433d61c11cbd7ed22ae218d1787c74415d1747c173a",
+      "worktree": "b159e89b89f117b2fb34f433d61c11cbd7ed22ae218d1787c74415d1747c173a"
+    },
+    "opencood/tools/train_ddp.py": {
+      "original": "be43d08825e4bceda85717e3e76bd510f6a19386a7ac4ac380dd64ba78ed45ab",
+      "worktree": "be43d08825e4bceda85717e3e76bd510f6a19386a7ac4ac380dd64ba78ed45ab"
+    },
+    "opencood/tools/train_utils.py": {
+      "original": "2552dd9cac641dd0d309576f037170b35462bce076e2ddea02cf9159a6af6d0f",
+      "worktree": "2552dd9cac641dd0d309576f037170b35462bce076e2ddea02cf9159a6af6d0f"
+    },
+    "opencood/tools/inference_doma_heter_in_order.py": {
+      "original": "06f679b90887aa8f0d48e04f5e1cf68182fc744b610a2301dabd3df567747d0e",
+      "worktree": "06f679b90887aa8f0d48e04f5e1cf68182fc744b610a2301dabd3df567747d0e"
+    },
+    "opencood/tools/doma_tools.py": {
+      "original": "13dbe6c0b5535554675c1783e8c182f6619ec31c67191c65dd07dadd8f2c155f",
+      "worktree": "13dbe6c0b5535554675c1783e8c182f6619ec31c67191c65dd07dadd8f2c155f"
+    }
+  },
+  "files": [
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/C_Only/final_infer/config.yaml",
+      "approved_sha256": "984fe802502a0e9603ed42177b9d223aab28b53e603e1c64476fcec0c5a45bef",
+      "sha256": "2e30442e6df2bb658e9b93828c5d13f962e7f95c94c606d335dd9cbafc86c2e3",
+      "size": 9565,
+      "category": "configuration"
+    },
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/C_Only/stage1/config.yaml",
+      "approved_sha256": "29c00dbfc08e32e0f02554ef4ff58090fad873b0f1446a7cc1699f8fbcda2edd",
+      "sha256": "3047f02ab3219bf0a04db0f15b698d8f1fb843b11e52c3269e8d3ae84ef7111d",
+      "size": 5745,
+      "category": "configuration"
+    },
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/C_Only/stage2/m2/config.yaml",
+      "approved_sha256": "753e9edf7eb3804a6a8a8e3eeca8679eb5cef8151a2bf998fa026f4b22a87416",
+      "sha256": "2bbfaa9891c37a9e089e2561f8706718266e94eb2fa8ce5c134103fa5a1cd31f",
+      "size": 6677,
+      "category": "configuration"
+    },
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/C_Only/stage2/m3/config.yaml",
+      "approved_sha256": "56cab6a1d0aac95026e5da5640a2fbd23c919cacdbde3a0b1b5b171db12c004e",
+      "sha256": "6d30251f899d913bc59685b35eeec68f0fa89f03d33076aa10163525476ed438",
+      "size": 6101,
+      "category": "configuration"
+    },
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/C_Only/stage2/m4/config.yaml",
+      "approved_sha256": "da219bf35131e5a72f82bbba95678b2bcf8b4ad83706d37ab4587de92b18a013",
+      "sha256": "74ab2641406065d8bd8792b9012cdc77a22181c4ddfcead1dc00a8eb83a0ff10",
+      "size": 6675,
+      "category": "configuration"
+    },
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/G_C/final_infer/config.yaml",
+      "approved_sha256": "e11dc86493bd37027133f12795c32cbb054277ea2353f851e968231a0f4e1f06",
+      "sha256": "5e7081756d9b39d993527be6c8d196536c26a4842d8a811eee9afd293814d2ee",
+      "size": 9561,
+      "category": "configuration"
+    },
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/G_C/stage1/config.yaml",
+      "approved_sha256": "8ab792e821d423d10fe063e044e248759159b1e80e869da3ba558f813bfdbf40",
+      "sha256": "4c619ecbe4072a9c78a34ca7dccbf485afd59fe4fbd8bf491977546ecd1c862b",
+      "size": 5741,
+      "category": "configuration"
+    },
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/G_C/stage2/m2/config.yaml",
+      "approved_sha256": "c5f2fa301012638bc087e38e7c7cb2e579d7ba5527165d4dfc0e85d09b175f64",
+      "sha256": "930fef8cd7c9fbcc64471ba871fbedb064403d6f1234727133326c31a1990f03",
+      "size": 6673,
+      "category": "configuration"
+    },
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/G_C/stage2/m3/config.yaml",
+      "approved_sha256": "e159f28e5ecaf0cc360e742dd3ad8bf4de2347d71213dc6140f9b1b55c680213",
+      "sha256": "cadd7106a94d2e39f3a0fdad9f78a967404b2c8a3f3206866f887a1e3781764b",
+      "size": 6097,
+      "category": "configuration"
+    },
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/G_C/stage2/m4/config.yaml",
+      "approved_sha256": "ac61653bd93d4e00a82633502a086a40ac942f76316eaa93ad7330a23b4daef5",
+      "sha256": "13351e1d136e8f4f425be070a89e59f3fc0e2772cdc06b8e29122bde54472a61",
+      "size": 6671,
+      "category": "configuration"
+    },
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/G_Only/final_infer/config.yaml",
+      "approved_sha256": "d88e6b7c9871450cff929f18062cf7c93bdb160966fd67ab9f8c218670395770",
+      "sha256": "27423079b9698b275c0061de22956ae4076d9f9d86958dd4f7e28ca7a1c60d28",
+      "size": 9565,
+      "category": "configuration"
+    },
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/G_Only/stage1/config.yaml",
+      "approved_sha256": "9623a37879c1534ac965c06d5ed2d0f0e5eca9a3399460ac935cf9f69e6dcd2a",
+      "sha256": "6bdc884c38cc0fffbb1637f04e9973985836a26079f3bfec30e8bece6d495625",
+      "size": 5745,
+      "category": "configuration"
+    },
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/G_Only/stage2/m2/config.yaml",
+      "approved_sha256": "b81d846b1810ea89776287d4c7bb8426151b8da399121c40ab74b02f41896a05",
+      "sha256": "47ec9427b7af7fc5580912929d8c8317a0132288c249bd75cf1c63cab8b58fdc",
+      "size": 6677,
+      "category": "configuration"
+    },
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/G_Only/stage2/m3/config.yaml",
+      "approved_sha256": "d5f1934efb12ff8f7d91f034d32437d777761effd069a5844e7d34a7920ce9b2",
+      "sha256": "fc7743835d24008c9421bc0bde1f30163e13cd996cb636eefaf91831dcf848ef",
+      "size": 6101,
+      "category": "configuration"
+    },
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/G_Only/stage2/m4/config.yaml",
+      "approved_sha256": "8240c895ccb07551c54ffeab31dde2241cb00e227fd1269230c0ac1816945670",
+      "sha256": "c524f71bff55c59217f0645a633622501550077675a9c81035cf938af872bcba",
+      "size": 6675,
+      "category": "configuration"
+    },
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/M_C/final_infer/config.yaml",
+      "approved_sha256": "cf6eef9bcc7a5c2a3bbb12a09b2cbcaeb424b0b117e3cb7540ffa70d60f9d57d",
+      "sha256": "54b1254a81eae90662ebf59807876fa5dec2a0ebb960d126d3b7acab124a6fb1",
+      "size": 9769,
+      "category": "configuration"
+    },
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/M_C/stage1/config.yaml",
+      "approved_sha256": "ef726110dbb7651ef1a62bda2246d1d98e8d6f90dde9989cb79483a9df792099",
+      "sha256": "d1da5b3f839433854f02d2c101cdc910d354886715b6e0acfdab96ce3c328b89",
+      "size": 5949,
+      "category": "configuration"
+    },
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/M_C/stage2/m2/config.yaml",
+      "approved_sha256": "53de5548abec3875bd97a90db204c8ff1108b4edb85ac60ed95807cb90a330ea",
+      "sha256": "c4cbee18c1b4fab57eee994219b0338f67f1856bcd84deb0b81e1ae34769695e",
+      "size": 6881,
+      "category": "configuration"
+    },
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/M_C/stage2/m3/config.yaml",
+      "approved_sha256": "5b41825e71b1ebbb77b2d5724b7d4143f5897913d778039d3182f9e20cf5a8a2",
+      "sha256": "0a24ae1ca05fc10ff5050dd5893ab93b24520ad35690f5b6a9c501104f1d44ec",
+      "size": 6305,
+      "category": "configuration"
+    },
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/M_C/stage2/m4/config.yaml",
+      "approved_sha256": "6c66d375a1068e707a504902409763dde1afa97e72933265ff4ce952198f4c2f",
+      "sha256": "a8bdef97f1a59e29a8286588721d158d77475e21271f084caf8c138c94527221",
+      "size": 6879,
+      "category": "configuration"
+    },
+    {
+      "path": "opencood/hypes_yaml/opv2v/MoreModality/DOMA/V2_R2_TABLE4_EXT/history_snapshot.json",
+      "approved_sha256": "17be7fbb15a919c8a9a890770e485f3e6f3bdb9631ae44281c6cd0beb859e16f",
+      "sha256": "17be7fbb15a919c8a9a890770e485f3e6f3bdb9631ae44281c6cd0beb859e16f",
+      "size": 140021,
+      "category": "support"
+    },
+    {
+      "path": "opencood/logs/temp/run_doma_table4_ext_ablation.sh",
+      "approved_sha256": "d53677943020493ea26dfc457c44f44ea974f1f168974052ea24770dadc4acaa",
+      "sha256": "d53677943020493ea26dfc457c44f44ea974f1f168974052ea24770dadc4acaa",
+      "size": 169,
+      "category": "support"
+    },
+    {
+      "path": "scripts/run_doma_table4_ext_ablation.sh",
+      "approved_sha256": "ed2466599652a2f6b091a1d85c0225efc1d8672822509a0e1969e1d042697c2c",
+      "sha256": "ed2466599652a2f6b091a1d85c0225efc1d8672822509a0e1969e1d042697c2c",
+      "size": 1799,
+      "category": "support"
+    },
+    {
+      "path": "opencood/tools/table4_ext.py",
+      "approved_sha256": "5b652ca96e9823fe835f15cd722033058a007b9472eba4571a226e548917df88",
+      "sha256": "5b652ca96e9823fe835f15cd722033058a007b9472eba4571a226e548917df88",
+      "size": 25999,
+      "category": "support"
+    },
+    {
+      "path": "opencood/tools/check_table4_ext.py",
+      "approved_sha256": "40fdcfc30de08a7c170aee04e88dc7da2152aedfa01da15c6d8111e40e8e360a",
+      "sha256": "40fdcfc30de08a7c170aee04e88dc7da2152aedfa01da15c6d8111e40e8e360a",
+      "size": 20225,
+      "category": "support"
+    },
+    {
+      "path": "opencood/tools/train_table4_ext.py",
+      "approved_sha256": "290a52791058ef8b16c7ac131c8265f4115ebc73531022fb1f6e0d8303f9f462",
+      "sha256": "290a52791058ef8b16c7ac131c8265f4115ebc73531022fb1f6e0d8303f9f462",
+      "size": 20450,
+      "category": "new_training_runtime_user_approved"
+    },
+    {
+      "path": "opencood/tools/table4_ext_state.py",
+      "approved_sha256": "697753c73a4a49c309d236d57f77dc67e7678940fc5aec0e78e8b0a6f0fae115",
+      "sha256": "697753c73a4a49c309d236d57f77dc67e7678940fc5aec0e78e8b0a6f0fae115",
+      "size": 5230,
+      "category": "new_training_runtime_user_approved"
+    },
+    {
+      "path": "docs/DOMA_TABLE4_EXT.md",
+      "approved_sha256": "50a48060f6158b4ec87a943d1ed990f11ea56f2703169adda23364ec49f65385",
+      "sha256": "85a8155f5b91f1f7d6ae474f3f2e0c02a8259591bc6d8d69b571cbac2237eb84",
+      "size": 16255,
+      "category": "support"
+    }
+  ],
+  "evidence": "/tmp/doma-table4-acceptance-hnpgw411",
+  "final_sync_complete": true
+}

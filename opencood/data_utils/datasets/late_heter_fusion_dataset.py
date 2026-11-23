@@ -110,7 +110,7 @@ def getLateheterFusionDataset(cls):
             """
                 processed_data_dict.keys() = ['ego', "650", "659", ...]
             """
-            base_data_dict = add_noise_data_dict(base_data_dict,self.params['noise_setting'])
+            base_data_dict = add_noise_data_dict(base_data_dict, self.params['noise_setting'], idx)
 
             processed_data_dict = OrderedDict()
             ego_id = -1

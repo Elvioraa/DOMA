@@ -9,7 +9,8 @@ class V2XSETBaseDataset(OPV2VBaseDataset):
     def __init__(self, params, visulize, train=True):
         super().__init__(params, visulize, train)
 
-        if self.load_camera_file is True: # '2021_09_09_13_20_58'. This scenario has only 3 camera files?
+        camera_compatible = params.get("v2xset_camera_compatible", False)
+        if self.load_camera_file is True or camera_compatible:
             scenario_folders_new = [x for x in self.scenario_folders if '2021_09_09_13_20_58' not in x]
             self.scenario_folders = scenario_folders_new
             self.reinitialize()

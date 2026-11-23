@@ -163,3 +163,10 @@ opencood/tools/save_params.py
 ./vscode
 .vscode
 opencood/tools/inference_w_noise_heter.py
+
+# Track only the Table4 extension launcher, never experiment outputs.
+!opencood/logs/
+opencood/logs/*
+!opencood/logs/temp/
+opencood/logs/temp/*
+!opencood/logs/temp/run_doma_table4_ext_ablation.sh

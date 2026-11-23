@@ -16,6 +16,7 @@ from opencood.hypes_yaml.yaml_utils import load_yaml
 from opencood.utils.pcd_utils import \
     mask_points_by_range, mask_ego_points, shuffle_points, \
     downsample_lidar_minimum
+from opencood.utils.pose_utils import add_noise_data_dict
 from opencood.utils.transformation_utils import x1_to_x2
 
 
@@ -41,6 +42,8 @@ def getEarlyFusionDataset(cls):
 
         def __getitem__(self, idx):
             base_data_dict = self.retrieve_base_data(idx)
+            if 'eval_pose_noise' in self.params['noise_setting']:
+                add_noise_data_dict(base_data_dict, self.params['noise_setting'], idx)
 
             processed_data_dict = OrderedDict()
             processed_data_dict['ego'] = {}

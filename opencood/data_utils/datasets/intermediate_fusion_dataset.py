@@ -242,7 +242,7 @@ def getIntermediateFusionDataset(cls):
 
         def __getitem__(self, idx):
             base_data_dict = self.retrieve_base_data(idx)
-            base_data_dict = add_noise_data_dict(base_data_dict,self.params['noise_setting'])
+            base_data_dict = add_noise_data_dict(base_data_dict, self.params['noise_setting'], idx)
 
             processed_data_dict = OrderedDict()
             processed_data_dict['ego'] = {}

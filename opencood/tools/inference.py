@@ -14,7 +14,7 @@ import opencood.hypes_yaml.yaml_utils as yaml_utils
 from opencood.tools import (inference_utils, seed_utils, train_utils,
                             validation_detection)
 from opencood.data_utils.datasets import build_dataset
-from opencood.utils import eval_utils
+from opencood.utils import eval_utils, eval_extensions
 from opencood.visualization import vis_utils, my_vis, simple_vis
 from opencood.utils.common_utils import update_dict
 torch.multiprocessing.set_sharing_strategy('file_system')
@@ -36,6 +36,7 @@ def test_parser():
     parser.add_argument('--no_score', action='store_true',
                         help="whether print the score of prediction")
     parser.add_argument('--note', default="", type=str, help="any other thing?")
+    eval_extensions.add_arguments(parser)
     opt = parser.parse_args()
     return opt
 
@@ -46,6 +47,7 @@ def main():
     assert opt.fusion_method in ['late', 'early', 'intermediate', 'no', 'no_w_uncertainty', 'single'] 
 
     hypes = yaml_utils.load_yaml(None, opt)
+    eval_extensions.configure_noise(hypes, opt)
     seed = seed_utils.seed_from_hypes(hypes)
 
     if 'heter' in hypes:
@@ -112,6 +114,7 @@ def main():
     # build dataset for each noise setting
     print('Dataset Building')
     opencood_dataset = build_dataset(hypes, visualize=True, train=False)
+    bucket_ap = eval_extensions.DistanceBucketAP() if opt.eval_distance_buckets else None
     # opencood_dataset_subset = Subset(opencood_dataset, range(640,2100))
     # data_loader = DataLoader(opencood_dataset_subset,
     data_loader = DataLoader(opencood_dataset,
@@ -198,6 +201,9 @@ def main():
                                                 i,
                                                 npy_save_path)
 
+            if bucket_ap is not None:
+                bucket_ap.update(pred_box_tensor, pred_score, gt_box_tensor)
+            
             if not opt.no_score:
                 infer_result.update({'score_tensor': pred_score})
 
@@ -232,6 +238,8 @@ def main():
 
     _, ap50, ap70 = eval_utils.eval_final_results(result_stat,
                                 opt.model_dir, infer_info)
+    if bucket_ap is not None:
+        bucket_ap.print_summary()
 
 if __name__ == '__main__':
     main()
