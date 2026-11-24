@@ -69,7 +69,20 @@ def test_parser():
                         help="whether to degrade lidar. {m1:32, m3:16} and {m1:16, m3:16}")
     parser.add_argument('--note', default="", type=str, help="any other thing?")
     eval_extensions.add_arguments(parser)
+    parser.add_argument('--domar_plugin_ckpt', default=None)
+    parser.add_argument('--enable_quality_weight', action='store_true')
+    parser.add_argument('--enable_iou_calib', action='store_true')
+    parser.add_argument('--calib_gamma_override', type=float, default=None)
     opt = parser.parse_args()
+    if opt.calib_gamma_override is not None and (
+            not opt.enable_iou_calib or not 0 <= opt.calib_gamma_override <= 1):
+        parser.error('--calib_gamma_override requires calibration and a value in [0,1]')
+    if opt.enable_quality_weight or opt.enable_iou_calib:
+        if opt.disable_doma_refine:
+            parser.error('DOMA-R requires DOMA refinement')
+        opt.note += f'_domar_w{int(opt.enable_quality_weight)}_q{int(opt.enable_iou_calib)}'
+        if opt.calib_gamma_override is not None:
+            opt.note += f'_gamma{opt.calib_gamma_override}'
     return opt
 
 
@@ -173,6 +186,16 @@ def main():
     resume_epoch, model = train_utils.load_saved_model(
         saved_path, model, checkpoint_path=selected_checkpoint)
     assert_doma_qar_checkpoint_ready(model, resume_epoch)
+    if opt.domar_plugin_ckpt or opt.enable_quality_weight or opt.enable_iou_calib:
+        from opencood.models.sub_modules.domar_plugins import DOMARPlugins
+        heads = DOMARPlugins.from_model(model, hypes['train_params'].get('max_cav', 5))
+        if opt.domar_plugin_ckpt:
+            heads.load_state_dict(torch.load(opt.domar_plugin_ckpt, map_location='cpu'), strict=True)
+        if opt.enable_quality_weight or opt.enable_iou_calib:
+            model.domar_plugins = heads
+            model.domar_quality = opt.enable_quality_weight
+            model.domar_calibration = opt.enable_iou_calib
+            model.domar_gamma_override = opt.calib_gamma_override
     print(f"resume from {resume_epoch} epoch.")
     opt.note += f"_epoch{resume_epoch}"
     

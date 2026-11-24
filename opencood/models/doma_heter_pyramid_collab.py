@@ -141,7 +141,7 @@ class DOMAHeterPyramidCollab(nn.Module):
 
     def forward(self, data_dict):
         output_dict = {'pyramid': 'collab'}
-        if getattr(self, 'doma_enabled', False):
+        if getattr(self, 'doma_enabled', False) and not getattr(self, 'domar_stage15', False):
             configure_doma_trainability(self)
         agent_modality_list = data_dict['agent_modality_list'] 
         affine_matrix = normalize_pairwise_tfm(data_dict['pairwise_t_matrix'], self.H, self.W, self.fake_voxel_size)
@@ -194,7 +194,8 @@ class DOMAHeterPyramidCollab(nn.Module):
 
         doma_context = None
         if getattr(self, 'doma_enabled', False):
-            if self.doma_flags['quality']:
+            if (self.doma_flags['quality'] or getattr(self, 'domar_stage15', False)
+                    or hasattr(self, 'domar_plugins')):
                 doma_context = build_collab_doma_context(
                     self,
                     heter_feature_2d,
@@ -261,7 +262,9 @@ class DOMAHeterPyramidCollab(nn.Module):
         output_dict.update({'occ_single_list': 
                             occ_outputs})
 
-        if getattr(self, 'doma_enabled', False):
+        if getattr(self, 'domar_stage15', False):
+            output_dict['doma_context'] = doma_context
+        elif getattr(self, 'doma_enabled', False):
             doma_object = run_doma_training(
                 self, doma_context, data_dict, detector_output=output_dict
             )

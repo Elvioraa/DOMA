@@ -625,7 +625,7 @@ def build_collab_doma_context(
         if (
             model.doma_flags["quality"]
             and model.doma_config["quality"]["use_agent_distance"]
-        ):
+        ) or getattr(model, "domar_stage15", False) or hasattr(model, "domar_plugins"):
             if pairwise_t_matrix is None:
                 raise ValueError(
                     "quality-aware DOMA context requires pairwise_t_matrix"
@@ -923,7 +923,7 @@ def _detached_delta_iou(proposals, refined_boxes, targets):
 
 
 
-def predict_scene_residuals(model, scene, proposals):
+def predict_scene_residuals(model, scene, proposals, collect_domar=False):
     """Predict per-agent residuals and the explicitly selected consensus."""
     if not (model.doma_flags["object_encoder"] and model.doma_flags["refiner"]):
         raise RuntimeError("DOMA object encoder and refiner are required")
@@ -976,6 +976,7 @@ def predict_scene_residuals(model, scene, proposals):
                 "embeddings": context_roi_features.new_empty((0, embedding_dim)),
                 "valid_indices": empty_valid_indices,
             }
+    use_domar = collect_domar or hasattr(model, "domar_plugins")
     individual_quality = None
     if valid_indices.numel():
         proposal_indices = valid_indices[:, 0]
@@ -1033,7 +1034,7 @@ def predict_scene_residuals(model, scene, proposals):
         per_agent_residuals = individual_residuals.new_zeros(
             (proposal_count, agent_count, 8)
         ).index_put((proposal_indices, agent_indices), individual_residuals)
-        if qar_enabled:
+        if qar_enabled or use_domar:
             per_agent_object_embeddings = object_embedding.new_zeros(
                 (proposal_count, agent_count, embedding_dim)
             ).index_put((proposal_indices, agent_indices), object_embedding)
@@ -1090,7 +1091,7 @@ def predict_scene_residuals(model, scene, proposals):
         per_agent_residuals = agent_features.new_zeros(
             (proposal_count, agent_count, 8)
         )
-        if qar_enabled:
+        if qar_enabled or use_domar:
             geometry_dim = model.doma_config["geometry"]["hidden_dim"]
             per_agent_object_embeddings = agent_features.new_zeros(
                 (proposal_count, agent_count, embedding_dim)
@@ -1182,6 +1183,20 @@ def predict_scene_residuals(model, scene, proposals):
         )
         consensus_weights = quality_fallback = None
 
+    domar_inputs = domar_q = None
+    if use_domar:
+        distance = (proposals[:, None, :2] - scene["agent_positions"][None]).norm(dim=-1)
+        ego = torch.zeros_like(distance)
+        ego[:, 0] = 1
+        priors = torch.stack((distance.log1p(), detail_coverage,
+                              context_coverage if context_coverage is not None else
+                              torch.zeros_like(detail_coverage), ego), dim=-1)
+        domar_inputs = (per_agent_object_embeddings, per_agent_geometry_embeddings,
+                        priors, per_agent_residuals, valid_mask)
+        if not collect_domar:
+            fused_residuals, domar_q, consensus_weights = model.domar_plugins(
+                domar_inputs, model.domar_quality, model.domar_calibration)
+
     qar_prediction = None
     if qar_enabled:
         pooling_weights = _doma_consensus_pool_weights(
@@ -1246,6 +1261,10 @@ def predict_scene_residuals(model, scene, proposals):
                 "quality_fallback": quality_fallback,
             }
         )
+    if collect_domar:
+        result["domar_inputs"] = domar_inputs
+    if domar_q is not None:
+        result["domar_q"] = domar_q
     if protocol_enabled:
         result["_protocol_views"] = protocol_views
     if qar_enabled:
@@ -1615,6 +1634,11 @@ def refine_doma_detections(model, pred_box_tensor, pred_score, context):
     if valid_top_indices.numel():
         output_boxes[valid_top_indices] = refined_corners[apply_refinement]
 
+    if "domar_q" in result and valid_top_indices.numel():
+        pred_score = pred_score.clone()
+        pred_score[valid_top_indices] = model.domar_plugins.calibration.blend(
+            pred_score[valid_top_indices], result["domar_q"][apply_refinement],
+            model.domar_gamma_override)
     return output_boxes, pred_score
 
 

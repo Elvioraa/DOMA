@@ -31,6 +31,9 @@ def add_noise_data_dict(data_dict, noise_setting, sample_idx=None):
         We retrieve lidar_pose and add_noise to it.
         And set a clean pose.
     """
+    if noise_setting.get('domar_training_noise'):
+        xy, yaw = np.random.uniform(0.1, 0.6, 2) if np.random.random() < 0.7 else (0., 0.)
+        return add_eval_pose_noise(data_dict, xy, yaw, int(np.random.randint(2**31 - 1)), sample_idx)
     if 'eval_pose_noise' in noise_setting:
         return add_eval_pose_noise(data_dict, *noise_setting['eval_pose_noise'], sample_idx)
     if noise_setting['add_noise']:

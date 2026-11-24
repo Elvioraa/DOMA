@@ -1,1 +1,3 @@
 eval_ch4_baseline_noise.sh text eol=lf
+train_ch4_domar_plugin.sh text eol=lf
+eval_ch4_domar_noise.sh text eol=lf
