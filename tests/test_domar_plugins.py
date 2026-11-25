@@ -1,19 +1,21 @@
-"""CPU-only DOMA-R tests using synthetic BEV maps, boxes and poses."""
+"""Synthetic DOMA-R tests and an optional native CUDA vs Shapely comparison."""
 import itertools
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
 import yaml
 
-from opencood.models.sub_modules.doma_box_coder import boxes_hwl_to_corners_3d
+from opencood.models.sub_modules import domar_iou
+from opencood.models.sub_modules.doma_box_coder import (boxes_hwl_to_corners_3d,
+                                                        pairwise_rotated_bev_iou_hwl)
 from opencood.models.sub_modules.doma_object import (predict_scene_residuals,
                                                      refine_doma_detections,
                                                      uniform_geometry_consensus)
 from opencood.models.sub_modules.domar_plugins import DOMARPlugins, freeze_backbone, plugin_loss
 from opencood.tools.check_doma_functional import YAML_ROOT, _Holder
-from opencood.tools.train_domar_plugin import frozen_candidates
+from opencood.tools.train_domar_plugin import CollateScenes, frozen_candidates, parse_args, run_epoch
 from opencood.utils.pose_utils import add_noise_data_dict
 
 
@@ -109,6 +111,115 @@ class DOMARTest(unittest.TestCase):
             model.domar_gamma_override = 1.
             _, changed = refine_doma_detections(model, corners, scores, context)
             self.assertTrue(torch.allclose(changed, torch.full_like(scores, .5) if c else scores))
+
+
+class Stage15TrainingTest(unittest.TestCase):
+    @staticmethod
+    def rotated_boxes():
+        a = torch.tensor([[0., 0., -1., 1.5, 1.6, 4., .47],
+                          [1.3, -.7, 3., .8, 1.1, 3.4, -.82],
+                          [20., 0., 0., 2., 3., 6., 1.1]])
+        b = a[[0, 0, 1, 0, 0]].clone()
+        b[0, 2:4] = torch.tensor([10., 2.5])  # disjoint in height, identical in BEV
+        b[1, :2] += 2 * torch.stack([a[0, 6].cos(), a[0, 6].sin()])
+        b[2, :2] += torch.tensor([-.4, .6])
+        b[3, 6] += torch.pi
+        b[4, :2] += torch.tensor([.001, -.003])  # inside PCDet's unscaled corner margin
+        return a, b
+
+    def test_shapely_iou_matches_existing_box_convention(self):
+        a, b = self.rotated_boxes()
+        with patch.object(domar_iou, 'cuda_iou_ops', side_effect=AssertionError('CPU path')):
+            iou = domar_iou.rotated_bev_iou(a, b)
+        reference = pairwise_rotated_bev_iou_hwl(a, b)
+        torch.testing.assert_close(iou, reference, atol=1e-4, rtol=0)
+        torch.testing.assert_close(iou[0, [0, 1, 3]], torch.tensor([1., 1/3, 1.]),
+                                   atol=1e-4, rtol=0)
+        self.assertFalse(iou[2].any())
+        self.assertEqual(domar_iou.rotated_bev_iou(a, b[:0]).shape, (3, 0))
+        self.assertEqual(domar_iou.rotated_bev_iou(a[:0], b).shape, (0, 5))
+
+    def test_refined_iou_uses_original_gt_assignment(self):
+        p = torch.tensor([[0., 0., 0., 1., 1.5, 4., 0.]])
+        gt = p.repeat(2, 1)
+        gt[1, 0] = 8
+        r = torch.zeros(1, 8)
+        r[0, 0] = 2  # Move exactly onto the other GT.
+        _, target = plugin_loss(p, gt, r, torch.ones(1), torch.tensor([True]),
+                                'sin_cos_centered', 1.)
+        self.assertEqual(target.item(), 0.)
+
+    def test_nms_preserves_top1000_and_score_ties(self):
+        boxes = self.rotated_boxes()[0][:1].repeat(1001, 1)
+        boxes[-1, 0] = 20  # unique detection below the pre-NMS cut
+        corners = boxes_hwl_to_corners_3d(boxes)
+        scores = torch.ones(len(boxes))
+        scores[-1] = .1
+        expected = [scores.numpy().argsort()[::-1][0]]
+        self.assertEqual(domar_iou.proposal_nms(corners, scores, .3).tolist(), expected)
+        self.assertEqual(domar_iou.proposal_nms(corners[:0], scores[:0], .3).tolist(), [])
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'requires a CUDA device')
+    def test_cuda_iou_and_nms_match_shapely(self):
+        if domar_iou.cuda_iou_ops() is None:
+            self.skipTest('requires compiled PCDet CUDA ops')
+        a, b = self.rotated_boxes()
+        expected = domar_iou.rotated_bev_iou(a, b)
+        with patch.object(domar_iou, '_shapely_bev_iou', side_effect=AssertionError('CUDA path')):
+            actual = domar_iou.rotated_bev_iou(a.cuda(), b.cuda())
+        self.assertTrue(actual.is_cuda)
+        torch.testing.assert_close(actual.cpu(), expected, atol=1e-4, rtol=0)
+        with patch.object(domar_iou, 'cuda_iou_ops', return_value=None):
+            fallback = domar_iou.rotated_bev_iou(a.cuda(), b.cuda())
+        self.assertEqual(fallback.device, actual.device)
+        torch.testing.assert_close(fallback.cpu(), expected, atol=1e-4, rtol=0)
+        corners = boxes_hwl_to_corners_3d(torch.cat([a, b]))
+        scores = torch.tensor([.95, .8, .7, .95, .65, .55, .4, .6])
+        keep = domar_iou.proposal_nms(corners, scores, .3)
+        kept_cuda = domar_iou.proposal_nms(corners.cuda(), scores.cuda(), .3)
+        self.assertEqual(kept_cuda.tolist(), keep.tolist())
+
+    def test_trainer_cli(self):
+        args = ['--model_dir', 'm1', '--checkpoint', 'm1.pth', '--output_dir', 'stage15']
+        defaults = parse_args(args)
+        self.assertEqual((defaults.log_interval, defaults.num_workers), (50, 4))
+        opt = parse_args(args + ['--log_interval', '1', '--num_workers', '0'])
+        self.assertEqual((opt.log_interval, opt.num_workers), (1, 0))
+        self.assertEqual(parse_args(args + ['--workers', '2']).num_workers, 2)
+        for option, value in [('--log_interval', '0'), ('--num_workers', '-1')]:
+            with self.assertRaises(SystemExit):
+                parse_args(args + [option, value])
+
+    def test_progress_counts_empty_frames_and_flushes_both_splits(self):
+        class Frames(list):
+            post_processor = None
+
+            @staticmethod
+            def collate_batch_train(samples):
+                return {'ego': samples[0]}
+
+        frames = Frames([None, {}, {}])
+        loader = torch.utils.data.DataLoader(frames, batch_size=2, collate_fn=CollateScenes(frames))
+        model = Mock(doma_config={'refiner': {'yaw_mode': 'sin_cos_centered'}})
+        heads = DOMARPlugins(4, 3, 2)
+        optimizer = torch.optim.AdamW(heads.parameters(), lr=.001)
+        box = self.rotated_boxes()[0][:1]
+        inputs = (torch.ones(1, 2, 4), torch.ones(1, 2, 3), torch.ones(1, 2, 4),
+                  torch.zeros(1, 2, 8), torch.ones(1, 2, dtype=torch.bool))
+        data = inputs, box, torch.tensor([.8]), box
+        for split, opt, interval, steps in [('Train', optimizer, 1, [1, 2, 3]),
+                                            ('Val', None, 2, [2, 3])]:
+            with patch('opencood.tools.train_domar_plugin.frozen_candidates', side_effect=[data, None]), \
+                    patch('builtins.print') as logged:
+                run_epoch(model, heads, loader, opt, 1., torch.device('cpu'),
+                          epoch=2, epochs=8, log_interval=interval, lr=.001)
+            self.assertEqual(logged.call_count, len(steps))
+            for call, step in zip(logged.call_args_list, steps):
+                self.assertIn(f'[Stage1.5][{split}][Epoch 2/8][{step}/3]', call.args[0])
+                self.assertIn('lr=1.00e-03 elapsed=', call.args[0])
+                self.assertIn(' eta=', call.args[0])
+                self.assertTrue(call.kwargs['flush'])
+            self.assertIn('loss=n/a', logged.call_args.args[0])
 
 
 if __name__ == '__main__':
